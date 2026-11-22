@@ -98,7 +98,7 @@
 */
 
 /* 固件版本号 —— 必须在最前面, 首页/版本接口/更新逻辑都要用 */
-#define FW_VER       54
+#define FW_VER       55
 
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -113,6 +113,7 @@
 #include <WebServer.h>   /* v39: OTA */
 #include <Update.h>      /* v39: OTA */
 #include <Preferences.h> /* v50: 密钥/设置存盒子存储(NVS), 刷固件不丢 */
+#include <DNSServer.h>   /* v55: 配网热点 (连不上任何 WiFi 时自己开热点) */
 
 /* ##################################################################
    ######################  只改这两处  ##############################
@@ -127,10 +128,10 @@ String g_key = "";   /* 运行时从 NVS 读入, 见 loadSettings() */
    格式:  { "WiFi名字", "WiFi密码" },
    可以写任意多个, 自动连能连上的那个。                       */
 struct WiFiItem { const char* ssid; const char* pass; };
+/* v55: 这里留空也能用 —— 开机连不上就自己开热点 AIBox-Setup,
+   手机连上去填 WiFi 名和密码, 存在盒子里。想预置可以照下面格式加。 */
 WiFiItem WIFI_LIST[] = {
-  { "你的WiFi名字", "你的WiFi密码" },   /* 家里 */
-  { "第二个WiFi",   "第二个密码" },     /* 手机热点 */
-  /* 在这下面加新的, 照着上面格式写: */
+  { "预置WiFi名", "预置密码" },
   /* { "新的WiFi名", "新的密码" }, */
 };
 
@@ -193,6 +194,30 @@ int menuActive = 0;
 int menuCursor = 0;
 int menuSub = 0;
 unsigned long menuLastMs = 0;
+
+/* ================== v55: WiFi 存在 NVS 里 ==================
+   配网时手机填的 WiFi 名/密码存这里, 优先级高于固件里的 WIFI_LIST。
+   这样以后换热点、换地方, 不用改代码、不用发新版本。 */
+String g_wifiSsid = "";
+String g_wifiPass = "";
+
+void loadWifiCred() {
+  prefs.begin("aibox", true);
+  g_wifiSsid = prefs.getString("ssid", "");
+  g_wifiPass = prefs.getString("pass", "");
+  prefs.end();
+  Serial.printf(">>> wifi in NVS: %s\n", g_wifiSsid.length() ? g_wifiSsid.c_str() : "(none)");
+}
+
+void saveWifiCred(const String& ssid, const String& pass) {
+  prefs.begin("aibox", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+  g_wifiSsid = ssid;
+  g_wifiPass = pass;
+  Serial.printf(">>> wifi saved to NVS: %s\n", ssid.c_str());
+}
 
 void loadSettings() {
   prefs.begin("aibox", true);
@@ -1292,6 +1317,10 @@ void showIdle() {
 
 /* ================== WiFi ================== */
 bool connectWiFi() {
+  /* v55: NVS 里配过网就优先用它 (配网 > 固件里写死的列表) */
+  if (g_wifiSsid.length() > 0) {
+    wifiMulti.addAP(g_wifiSsid.c_str(), g_wifiPass.c_str());
+  }
   int n = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
   for (int i = 0; i < n; i++) {
     wifiMulti.addAP(WIFI_LIST[i].ssid, WIFI_LIST[i].pass);
@@ -1851,6 +1880,87 @@ void showKeyDiag() {
   }
 }
 
+/* ================== v55: 配网热点 (WiFi 连不上时用) ==================
+   连不上任何已知 WiFi -> 盒子自己开热点 AIBox-Setup (无密码),
+   手机连上去, 浏览器打开 http://192.168.4.1 , 填 WiFi 名/密码 -> 存 NVS -> 重启。
+   这样换热点/换地方再也不用改代码、不用发新版本。 */
+#define AP_SSID  "AIBox-Setup"
+
+WebServer cfgServer(80);
+DNSServer dnsServer;
+
+void drawSetupScreen() {
+  if (!screenOK) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print("WiFi SETUP");
+  display.setTextSize(2);
+  display.setCursor(0, 16);
+  display.print("AIBox-Setup");
+  display.setTextSize(1);
+  display.setCursor(0, 40);
+  display.print("join it, then open");
+  display.setCursor(0, 52);
+  display.print("192.168.4.1");
+  display.display();
+}
+
+void runConfigPortal() {
+  Serial.println(">>> no WiFi, starting config portal");
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID);
+  Serial.print(">>> AP IP: "); Serial.println(WiFi.softAPIP());
+  dnsServer.start(53, "*", WiFi.softAPIP());   /* 任何域名都跳到配置页 */
+
+  cfgServer.on("/", HTTP_GET, []() {
+    String h = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+    h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    h += "<title>AI Box WiFi</title></head><body style='font-family:sans-serif;max-width:420px;margin:20px auto;padding:0 14px'>";
+    h += "<h3>AI Box WiFi Setup</h3>";
+    h += "<form method='GET' action='/save'>";
+    h += "<p>WiFi name<br><input name='ssid' style='width:100%;padding:10px;font-size:16px' value='";
+    h += g_wifiSsid; h += "'></p>";
+    h += "<p>Password<br><input name='pass' type='password' style='width:100%;padding:10px;font-size:16px'></p>";
+    h += "<button style='padding:12px 30px;font-size:16px'>CONNECT</button></form>";
+    h += "<p style='color:#888;font-size:13px'>After saving the box restarts and joins your WiFi.</p>";
+    h += "</body></html>";
+    cfgServer.send(200, "text/html", h);
+  });
+
+  cfgServer.on("/save", HTTP_GET, []() {
+    String ssid = cfgServer.arg("ssid");
+    String pass = cfgServer.arg("pass");
+    ssid.trim();
+    if (ssid.length() == 0) {
+      cfgServer.send(200, "text/html", "<h3>WiFi name is empty</h3><p><a href='/'>back</a></p>");
+      return;
+    }
+    saveWifiCred(ssid, pass);
+    cfgServer.send(200, "text/html",
+      "<h3>Saved!</h3><p>Box is restarting and will join your WiFi.</p>");
+    if (screenOK) {
+      display.clearDisplay(); display.setTextSize(1);
+      display.setCursor(0, 20); display.print("SAVED");
+      display.setCursor(0, 36); display.print("rebooting...");
+      display.display();
+    }
+    delay(1500);
+    ESP.restart();
+  });
+
+  cfgServer.begin();
+  drawSetupScreen();
+
+  /* 一直停在配网模式, 直到有人填好 (填好后自动重启) */
+  while (true) {
+    dnsServer.processNextRequest();
+    cfgServer.handleClient();
+    delay(2);
+  }
+}
+
 /* ================== setup ================== */
 void setup() {
   Serial.begin(115200);
@@ -1859,6 +1969,7 @@ void setup() {
   Serial.printf("=== AI Box v%d ===\n", FW_VER);
 
   loadSettings();                       /* v50: 密钥/亮度/音量/走马灯 从 NVS 读入 */
+  loadWifiCred();                       /* v55: NVS 里配过网的话优先用 */
 
   pixels.begin();
   pixels.clear();
@@ -1908,12 +2019,13 @@ void setup() {
 
   /* WiFi */
   if (!connectWiFi()) {
-    screen2("WiFi FAIL", "retry in 5s");
-    /* v43: 以前是 while(1) 死等, 路由器一断就只能断电重启。改成无限重试 */
-    while (!wifiReady) {
-      delay(5000);
+    /* v55: 重试两轮仍失败 -> 开热点让手机配网 (以前是死等, 出门在外没救) */
+    screen2("WiFi FAIL", "retrying...");
+    for (int r = 0; r < 2 && !wifiReady; r++) {
+      delay(3000);
       if (connectWiFi()) break;
     }
+    if (!wifiReady) runConfigPortal();   /* 不返回, 填好会自己重启 */
   }
   screen2("WiFi OK", WiFi.localIP().toString().c_str());
   delay(600);
