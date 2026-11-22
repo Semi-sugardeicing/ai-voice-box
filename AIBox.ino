@@ -1,6 +1,11 @@
 /*
   ========================================
-   版本: v52 (OTA推送也有底部进度条 + 设密钥立刻显示余额)
+   版本: v53 (按键自检屏 + 菜单外 K1/K2 也有反应)
+   日期: 2026-11-22
+   改动一: 同时按住 K1+K2 一秒 -> 按键自检屏, 直接显示四个键当前电平和引脚号,
+           用来排查"按键没反应"到底是哪根线/哪个脚的问题。按住 K4 两秒退出。
+   改动二: 菜单外 K1=暗一档 / K2=亮一档, 立刻有反应(以前只有 K3/K4 有用)。
+   上一版: v52 (OTA推送也有底部进度条 + 设密钥立刻显示余额)
    日期: 2026-11-22
    改动一: 电脑 curl 推送固件时, 屏幕除了 KB 数再加底部进度条+百分比
            (总大小取 HTTP 请求 Content-Length 估算)。
@@ -87,7 +92,7 @@
 */
 
 /* 固件版本号 —— 必须在最前面, 首页/版本接口/更新逻辑都要用 */
-#define FW_VER       52
+#define FW_VER       53
 
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -1790,6 +1795,56 @@ void updateFromSource(bool fromPC) {
   showIdle();
 }
 
+/* ================== v53: 按键自检屏 ==================
+   同时按住 K1+K2 一秒以上松开 -> 显示四个键当前电平。
+   松开=HIGH(1), 按下=LOW(0)。哪个键不管按不按都是 1, 就是那个键/那根线的问题;
+   一直 0 说明短路到地。也显示当前引脚定义, 核对接线。 */
+void showKeyDiag() {
+  while (true) {
+    if (screenOK) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.print("KEY DIAG");
+      display.setCursor(90, 0);
+      display.print("v");
+      display.print(FW_VER);
+
+      struct { const char* nm; int pin; } ks[4] = {
+        { "K1 ^", BTN_K1 },
+        { "K2 v", BTN_BRIGHT },
+        { "K3 #", BTN_REPLAY },
+        { "K4 *", BTN_TALK }
+      };
+      for (int i = 0; i < 4; i++) {
+        int y = 12 + i * 10;
+        int lv = digitalRead(ks[i].pin);
+        display.setCursor(0, y);
+        display.print(ks[i].nm);
+        display.setCursor(30, y);
+        display.print("G");
+        display.print(ks[i].pin);
+        display.setCursor(52, y);
+        display.print(lv == LOW ? "DOWN" : " -- ");
+        display.setCursor(88, y);
+        display.print(lv);
+      }
+      display.setCursor(0, 56);
+      display.print("hold K4 2s = exit");
+      display.display();
+    }
+    /* 按住 K4 两秒退出 */
+    if (digitalRead(BTN_TALK) == LOW) {
+      unsigned long t0 = millis();
+      while (digitalRead(BTN_TALK) == LOW && millis() - t0 < 2000) delay(10);
+      if (millis() - t0 >= 2000) { showIdle(); return; }
+    }
+    otaServer.handleClient();
+    delay(80);
+  }
+}
+
 /* ================== setup ================== */
 void setup() {
   Serial.begin(115200);
@@ -2413,6 +2468,41 @@ void loop() {
         drawMenu();
         Serial.println(">>> menu open");
         delay(300);
+      }
+    }
+    /* v53: K1+K2 同时按 1 秒 = 按键自检屏 */
+    else if (digitalRead(BTN_K1) == LOW && digitalRead(BTN_BRIGHT) == LOW) {
+      unsigned long t0 = millis();
+      while (millis() - t0 < 1000) {
+        if (digitalRead(BTN_K1) != LOW || digitalRead(BTN_BRIGHT) != LOW) break;
+        delay(20);
+      }
+      if (millis() - t0 >= 1000) {
+        Serial.println(">>> key diag mode");
+        while (digitalRead(BTN_K1) == LOW || digitalRead(BTN_BRIGHT) == LOW) delay(20);
+        showKeyDiag();
+        Serial.println(">>> key diag exit");
+      }
+    }
+    /* v53: 菜单外 K1/K2 也有反馈 —— K1 亮一档, K2 暗一档 (和菜单里一致: K1=减/K2=加) */
+    else if (digitalRead(BTN_K1) == LOW) {
+      delay(25);
+      if (digitalRead(BTN_K1) == LOW) {
+        g_bright = (g_bright + 1) % 3;   /* 变暗一档 */
+        applyBrightness();
+        saveSettings();
+        Serial.printf(">>> K1 bright=%d\n", g_bright);
+        delay(250);
+      }
+    }
+    else if (digitalRead(BTN_BRIGHT) == LOW) {
+      delay(25);
+      if (digitalRead(BTN_BRIGHT) == LOW) {
+        g_bright = (g_bright + 2) % 3;   /* 变亮一档 */
+        applyBrightness();
+        saveSettings();
+        Serial.printf(">>> K2 bright=%d\n", g_bright);
+        delay(250);
       }
     }
     otaServer.handleClient();        /* v39: OTA 监听 */
