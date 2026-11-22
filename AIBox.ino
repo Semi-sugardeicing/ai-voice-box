@@ -114,6 +114,7 @@
 #include <Update.h>      /* v39: OTA */
 #include <Preferences.h> /* v50: 密钥/设置存盒子存储(NVS), 刷固件不丢 */
 #include <DNSServer.h>   /* v55: 配网热点 (连不上任何 WiFi 时自己开热点) */
+#include <esp_ota_ops.h> /* v56: 强制回滚 (切到另一个 OTA 分区里的上一版固件) */
 
 /* ##################################################################
    ######################  只改这两处  ##############################
@@ -130,10 +131,11 @@ String g_key = "";   /* 运行时从 NVS 读入, 见 loadSettings() */
 struct WiFiItem { const char* ssid; const char* pass; };
 /* v56: 只预置手机热点 (出门在外靠它自己更新)。
    家里 WiFi 故意不写进固件 —— 避免公开暴露家庭网络/大致位置。
-   回家连不上会自动开 AIBox-Setup 热点, 手机填一次就永久记住(NVS)。 */
+   回家连不上会自动开 esp32-S3开发版 热点, 手机填一次就永久记住(NVS)。 */
+/* v56: 这里可以留空 —— 开机连不上会自己开热点 esp32-S3开发版,
+   手机连上去填 WiFi 名和密码(支持多个), 存在盒子里。 */
 WiFiItem WIFI_LIST[] = {
-  { "一加 Ace 3",  "123456ok" },     /* 手机热点 */
-  /* 在这下面加新的, 照着上面格式写: */
+  { "预置WiFi名", "预置密码" },
   /* { "新的WiFi名", "新的密码" }, */
 };
 
@@ -200,25 +202,64 @@ unsigned long menuLastMs = 0;
 /* ================== v55: WiFi 存在 NVS 里 ==================
    配网时手机填的 WiFi 名/密码存这里, 优先级高于固件里的 WIFI_LIST。
    这样以后换热点、换地方, 不用改代码、不用发新版本。 */
-String g_wifiSsid = "";
-String g_wifiPass = "";
+/* v56: 多 WiFi 列表, 存 NVS. 最多 MAX_WIFI 条. */
+#define MAX_WIFI 8
+struct SavedWifi { String ssid; String pass; };
+SavedWifi g_saved[MAX_WIFI];
+int g_savedN = 0;
 
 void loadWifiCred() {
   prefs.begin("aibox", true);
-  g_wifiSsid = prefs.getString("ssid", "");
-  g_wifiPass = prefs.getString("pass", "");
+  int n = prefs.getInt("wifiN", 0);
+  if (n < 0) n = 0;
+  if (n > MAX_WIFI) n = MAX_WIFI;
+  g_savedN = n;
+  for (int i = 0; i < n; i++) {
+    g_saved[i].ssid = prefs.getString(("s" + String(i)).c_str(), "");
+    g_saved[i].pass = prefs.getString(("p" + String(i)).c_str(), "");
+  }
   prefs.end();
-  Serial.printf(">>> wifi in NVS: %s\n", g_wifiSsid.length() ? g_wifiSsid.c_str() : "(none)");
+  Serial.printf(">>> wifi in NVS: %d saved\n", g_savedN);
+  for (int i = 0; i < g_savedN; i++)
+    Serial.printf("      [%d] %s\n", i, g_saved[i].ssid.c_str());
 }
 
-void saveWifiCred(const String& ssid, const String& pass) {
+void persistWifiList() {
   prefs.begin("aibox", false);
-  prefs.putString("ssid", ssid);
-  prefs.putString("pass", pass);
+  prefs.putInt("wifiN", g_savedN);
+  for (int i = 0; i < MAX_WIFI; i++) {
+    if (i < g_savedN) {
+      prefs.putString(("s" + String(i)).c_str(), g_saved[i].ssid);
+      prefs.putString(("p" + String(i)).c_str(), g_saved[i].pass);
+    } else {
+      prefs.remove(("s" + String(i)).c_str());
+      prefs.remove(("p" + String(i)).c_str());
+    }
+  }
   prefs.end();
-  g_wifiSsid = ssid;
-  g_wifiPass = pass;
-  Serial.printf(">>> wifi saved to NVS: %s\n", ssid.c_str());
+  Serial.printf(">>> wifi list persisted: %d entries\n", g_savedN);
+}
+
+/* 加一条(已存在则更新密码), 返回 true=新增 */
+bool addWifi(const String& ssid, const String& pass) {
+  if (ssid.length() == 0) return false;
+  for (int i = 0; i < g_savedN; i++) {
+    if (g_saved[i].ssid == ssid) { g_saved[i].pass = pass; persistWifiList(); return false; }
+  }
+  if (g_savedN >= MAX_WIFI) return false;
+  g_saved[g_savedN].ssid = ssid;
+  g_saved[g_savedN].pass = pass;
+  g_savedN++;
+  persistWifiList();
+  return true;
+}
+
+/* 删第 idx 条 */
+void removeWifi(int idx) {
+  if (idx < 0 || idx >= g_savedN) return;
+  for (int i = idx; i < g_savedN - 1; i++) g_saved[i] = g_saved[i + 1];
+  g_savedN--;
+  persistWifiList();
 }
 
 void loadSettings() {
@@ -1319,9 +1360,9 @@ void showIdle() {
 
 /* ================== WiFi ================== */
 bool connectWiFi() {
-  /* v55: NVS 里配过网就优先用它 (配网 > 固件里写死的列表) */
-  if (g_wifiSsid.length() > 0) {
-    wifiMulti.addAP(g_wifiSsid.c_str(), g_wifiPass.c_str());
+  /* v56: NVS 里的多个 WiFi 全部加进去 (配网 > 固件里写死的列表) */
+  for (int i = 0; i < g_savedN; i++) {
+    wifiMulti.addAP(g_saved[i].ssid.c_str(), g_saved[i].pass.c_str());
   }
   int n = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
   for (int i = 0; i < n; i++) {
@@ -1331,7 +1372,23 @@ bool connectWiFi() {
   Serial.print("WiFi connecting");
   screen2("WiFi...", "connecting");
   int tries = 0;
+  /* v56: 等待期间也扫描按键 —— 以前这里纯 delay, 卡住时按键全没反应。
+     按 K3 立刻放弃等待, 直接进配网。 */
   while (wifiMulti.run() != WL_CONNECTED && tries < 40) {
+    if (digitalRead(BTN_REPLAY) == LOW) {
+      delay(30);
+      if (digitalRead(BTN_REPLAY) == LOW) {
+        Serial.println("\n>>> K3 pressed while connecting: skip to setup");
+        if (screenOK) {
+          display.clearDisplay(); display.setTextSize(1);
+          display.setCursor(0, 20); display.print("WiFi skipped");
+          display.setCursor(0, 36); display.print("K3 -> setup");
+          display.display();
+        }
+        delay(600);
+        return false;
+      }
+    }
     delay(500);
     Serial.print(".");
     tries++;
@@ -1369,6 +1426,29 @@ int calibrate() {
      curl -X POST --data-binary "@aibox.ino.bin" http://<板子IP>:8080/update
    传完自动重启, 屏幕上显示百分比。*/
 WebServer otaServer(8080);
+WebServer cfgServer(80);   /* v56: 配网门户(80端口) */
+
+/* v56: 配对码 / 恢复码 状态 */
+unsigned long g_pinEpoch = 0;
+String g_pin = "";
+bool   g_pinOK = false;
+String g_recover = "";
+
+/* ================== v56: 前置声明 ==================
+   函数定义分散在文件各处, Arduino 自动原型有时生成不全,
+   这里手工补上, 避免 "was not declared in this scope"。 */
+void   handleConfigPage();
+void   handleSaveKey();
+void   handleAddWifi();
+void   handleDelWifi();
+void   handleSaveRecover();
+String buildConfigHtml();
+void   refreshPinIfNeeded();
+int    pinRemainSec();
+String recoverPretty();
+bool   rollbackToOtherPartition();
+void   drawRollbackConfirm();
+void   runConfigPortal();
 
 /* ================== v45: OTA 上传口令 ==================
    没带正确口令的推送一律拒绝(401), 防止同网段别人给你刷固件。
@@ -1450,41 +1530,174 @@ void handleOtaDone() {
 /* ================== v50: 网页配置 (密钥等) ==================
    浏览器打开 http://盒子IP:8080/config (会要 OTA 口令), 填一次密钥就行。
    密钥存 NVS, 以后刷固件不丢, 固件文件里永不含密钥。 */
-void handleConfigPage() {
-  if (!otaAuthorized()) return;
+/* ================== v56: 配置页 (密钥 + 多 WiFi) ==================
+   浏览器打开 http://192.168.4.1 (配网时) 或 http://板子IP:8080/config
+   密钥打码显示, WiFi 列表可增可删。热点密码本身就是唯一凭证。 */
+/* 生成配置页 HTML (密钥 + WiFi 列表). 配网门户和 OTA 页面共用。 */
+String buildConfigHtml() {
+  String msg = "";
+  if (cfgServer.hasArg("msg")) msg = cfgServer.arg("msg");
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>AI Box Config</title></head><body style='font-family:sans-serif;max-width:420px;margin:24px auto;padding:0 12px'>";
-  html += "<h3>AI Box Config</h3>";
-  html += "<p>IP " + WiFi.localIP().toString() + " | fw v" + String(FW_VER) + "</p>";
-  html += "<p>DeepSeek Key: <b>";
-  html += (g_key.length() >= 20) ? "SET" : "NOT SET!";
-  html += "</b></p><form method='POST' action='/config'>";
-  html += "<input name='key' style='width:100%;padding:8px' placeholder='sk-...' autocomplete='off'><br><br>";
-  html += "<button type='submit' style='padding:8px 24px'>SAVE</button></form>";
+  html += "<title>AI 盒子设置</title>";
+  html += "<style>";
+  html += "*{box-sizing:border-box}body{font-family:-apple-system,system-ui,sans-serif;";
+  html += "max-width:440px;margin:0 auto;padding:16px;background:#f2f3f5;color:#1a1a1a}";
+  html += "h2{margin:8px 0 4px;font-size:24px}";
+  html += ".sub{color:#8a94a6;font-size:13px;margin-bottom:16px}";
+  html += ".card{background:#fff;border-radius:10px;padding:16px;margin-bottom:14px}";
+  html += ".ttl{font-size:16px;font-weight:600;margin-bottom:12px}";
+  html += ".wifi{background:#f7f9fc;border-radius:8px;padding:10px 12px;margin-bottom:8px;";
+  html += "display:flex;align-items:center;justify-content:space-between}";
+  html += ".wn{font-size:14px;font-weight:500}.wp{font-size:12px;color:#aab2c0;margin-top:2px}";
+  html += ".del{background:#fdeaea;color:#d64545;border:0;border-radius:6px;";
+  html += "padding:8px 14px;font-size:13px;cursor:pointer}";
+  html += "input{width:100%;padding:11px 12px;font-size:15px;border:0;border-radius:6px;";
+  html += "background:#f5f7fa;margin-bottom:10px}";
+  html += ".btn{width:100%;padding:14px;font-size:16px;border:0;border-radius:8px;";
+  html += "background:#1f6feb;color:#fff;cursor:pointer;margin-bottom:8px}";
+  html += ".btn2{background:#eef1f5;color:#4a5568}";
+  html += ".ok{background:#e8f6ec;color:#1f7a44;padding:10px 12px;border-radius:6px;font-size:13px}";
+  html += ".warn{background:#fdeaea;color:#b03a3a;padding:10px 12px;border-radius:6px;font-size:13px}";
+  html += ".hint{color:#a3abb8;font-size:12px;line-height:1.7}";
+  html += "</style></head><body>";
+
+  html += "<h2>AI 盒子设置</h2>";
+  html += "<div class='sub'>esp32-S3开发版 &middot; 固件 v" + String(FW_VER) + "</div>";
+
+  if (msg == "key")   html += "<div class='ok'>密钥已保存</div><br>";
+  if (msg == "wifi")  html += "<div class='ok'>WiFi 已保存，盒子正在重启</div><br>";
+  if (msg == "del")   html += "<div class='ok'>已删除</div><br>";
+  if (msg == "full")  html += "<div class='warn'>WiFi 列表已满(最多 8 条)</div><br>";
+  if (msg == "bad")   html += "<div class='warn'>名称不能为空</div><br>";
+
+  /* ---- 密钥卡片 ---- */
+  html += "<div class='card'><div class='ttl'>DeepSeek 密钥</div>";
+  if (g_key.length() >= 20) {
+    html += "<div class='ok'>● 已保存</div><div style='margin-top:10px;color:#8a94a6;font-size:13px'>";
+    html += g_key.substring(0, 3) + "&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;";
+    html += g_key.substring(g_key.length() - 4);
+    html += "<br><span style='font-size:11px;color:#aab2c0'>(只显示首尾，中间打码)</span></div>";
+  } else {
+    html += "<div class='warn'>尚未设置密钥</div>";
+  }
+  html += "<form method='POST' action='/savekey' style='margin-top:12px'>";
+  html += "<input name='key' placeholder='填入新的 sk-...' autocomplete='off'>";
+  html += "<button class='btn btn2' type='submit'>只保存密钥</button></form></div>";
+
+  /* ---- WiFi 列表 ---- */
+  html += "<div class='card'><div class='ttl'>已保存的 WiFi</div>";
+  if (g_savedN == 0) {
+    html += "<div class='hint' style='margin-bottom:10px'>还没有保存任何 WiFi</div>";
+  }
+  for (int i = 0; i < g_savedN; i++) {
+    html += "<div class='wifi'><div><div class='wn'>" + g_saved[i].ssid + "</div>";
+    html += "<div class='wp'>&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;</div></div>";
+    html += "<form method='POST' action='/delwifi' style='margin:0'>";
+    html += "<input type='hidden' name='i' value='" + String(i) + "'>";
+    html += "<button class='del' onclick='return confirm(\"确定删除这个 WiFi 吗？\")'>删除</button>";
+    html += "</form></div>";
+  }
+  html += "</div>";
+
+  /* ---- 添加 WiFi ---- */
+  html += "<div class='card'><div class='ttl'>添加 WiFi</div>";
+  html += "<form method='POST' action='/addwifi'>";
+  html += "<input name='ssid' placeholder='WiFi 名称' autocomplete='off'>";
+  html += "<input name='pass' type='password' placeholder='密码' autocomplete='off'>";
+  html += "<button class='btn' type='submit'>保存并连接</button></form></div>";
+
+  /* 恢复码: 忘了 4 位配对码时用这个进 */
+  html += "<div class='card'><div class='ttl'>恢复码</div>";
+  html += "<div style='font-size:22px;letter-spacing:2px;font-weight:600;color:#1f6feb'>";
+  html += recoverPretty();
+  html += "</div><div class='hint' style='margin-top:8px'>忘了 4 位配对码时，在首页输入这个码即可进入。<br>";
+  html += "此码用于忘记 4 位配对码时进入，改完立即生效。</div>";
+  html += "<form method='POST' action='/saverecover' style='margin-top:12px'>";
+  html += "<input name='r' placeholder='修改恢复码(至少4位)' autocomplete='off'>";
+  html += "<button class='btn btn2' type='submit'>保存恢复码</button></form></div>";
+
+  html += "<div class='hint'>可保存多个 WiFi，盒子会自动连能连上的那个。<br>";
+  html += "密钥和各 WiFi 都存在盒子内部，刷固件不会丢。</div>";
   html += "</body></html>";
-  otaServer.send(200, "text/html", html);
+
+  if (WiFi.status() == WL_CONNECTED) otaServer.send(200, "text/html", html);
+  else                                cfgServer.send(200, "text/html", html);
 }
 
-void handleConfigSave() {
-  if (!otaAuthorized()) return;
-  String k = otaServer.arg("key");
+/* ---- 只存密钥 (不重启) ---- */
+void handleSaveKey() {
+  String k = otaServer.hasArg("key") ? otaServer.arg("key") : cfgServer.arg("key");
   k.trim();
-  if (k.length() < 20) { otaServer.send(400, "text/plain", "key too short"); return; }
+  if (k.length() < 20) { otaServer.sendHeader("Location", "/?msg=bad"); otaServer.send(303); return; }
   prefs.begin("aibox", false);
   prefs.putString("key", k);
   prefs.end();
   g_key = k;
-  Serial.println(">>> key saved via /config");
-  otaServer.send(200, "text/plain", "OK, key saved.");
-  fetchBalance();     /* v52: 设完密钥立刻把余额刷上屏, 眼见为实 */
+  Serial.println(">>> key saved via web");
+  fetchBalance();                       /* 立刻把余额刷上屏 */
   showIdle();
+  otaServer.sendHeader("Location", "/?msg=key");
+  otaServer.send(303);
+}
+
+/* ---- 添加 WiFi ---- */
+void handleAddWifi() {
+  String ssid = otaServer.arg("ssid");
+  String pass = otaServer.arg("pass");
+  ssid.trim();
+  if (ssid.length() == 0) { otaServer.sendHeader("Location", "/?msg=bad"); otaServer.send(303); return; }
+  if (g_savedN >= MAX_WIFI) { otaServer.sendHeader("Location", "/?msg=full"); otaServer.send(303); return; }
+  addWifi(ssid, pass);
+  otaServer.send(200, "text/html",
+    "<meta charset='utf-8'><h3>WiFi 已保存</h3><p>盒子即将重启并连接…</p>");
+  if (screenOK) {
+    display.clearDisplay(); display.setTextSize(1);
+    display.setCursor(0, 20); display.print("SAVED");
+    display.setCursor(0, 36); display.print("rebooting...");
+    display.display();
+  }
+  delay(1500);
+  ESP.restart();
+}
+
+/* ---- 删除 WiFi ---- */
+void handleDelWifi() {
+  int i = otaServer.arg("i").toInt();
+  removeWifi(i);
+  otaServer.sendHeader("Location", "/?msg=del");
+  otaServer.send(303);
+}
+
+/* v56: 修改恢复码 */
+void handleSaveRecover() {
+  String r = otaServer.arg("r");
+  r.trim();
+  r.toUpperCase();
+  if (r.length() >= 4) {
+    prefs.begin("aibox", false);
+    prefs.putString("recover", r);
+    prefs.end();
+    g_recover = r;
+    Serial.printf(">>> recovery code changed to: %s\n", r.c_str());
+  }
+  otaServer.sendHeader("Location", "/?msg=key");
+  otaServer.send(303);
+}
+
+/* OTA 服务上的配置页入口 (已联网时用 :8080/config 访问) */
+void handleConfigPage() {
+  if (!otaAuthorized()) return;
+  otaServer.send(200, "text/html", buildConfigHtml());
 }
 
 void startOtaServer() {
   otaServer.on("/update", HTTP_POST, handleOtaDone, handleOtaFile);
-  otaServer.on("/config", HTTP_GET, handleConfigPage);    /* v50: 配置页 */
-  otaServer.on("/config", HTTP_POST, handleConfigSave);   /* v50: 保存密钥 */
+  otaServer.on("/config", HTTP_GET, handleConfigPage);      /* v56: 配置页(密钥+WiFi) */
+  otaServer.on("/savekey", HTTP_POST, handleSaveKey);       /* v56: 只存密钥 */
+  otaServer.on("/addwifi", HTTP_POST, handleAddWifi);       /* v56: 添加 WiFi */
+  otaServer.on("/delwifi", HTTP_POST, handleDelWifi);       /* v56: 删除 WiFi */
+  otaServer.on("/saverecover", HTTP_POST, handleSaveRecover); /* v56: 改恢复码 */
   otaServer.on("/", HTTP_GET, []() {
     if (!otaAuthorized()) return;
     otaServer.send(200, "text/plain", "AI Box OTA ready (auth ok).\n");
@@ -1883,65 +2096,203 @@ void showKeyDiag() {
 }
 
 /* ================== v55: 配网热点 (WiFi 连不上时用) ==================
-   连不上任何已知 WiFi -> 盒子自己开热点 AIBox-Setup (无密码),
+   连不上任何已知 WiFi -> 盒子自己开热点 esp32-S3开发版 (密码 123456),
    手机连上去, 浏览器打开 http://192.168.4.1 , 填 WiFi 名/密码 -> 存 NVS -> 重启。
    这样换热点/换地方再也不用改代码、不用发新版本。 */
-#define AP_SSID  "AIBox-Setup"
+#define AP_SSID  "esp32-S3开发版"
+#define AP_PASS  "123456"
 
-WebServer cfgServer(80);
 DNSServer dnsServer;
+
+/* v56: 前置声明, drawSetupScreen 要用到配对码相关函数 */
+void refreshPinIfNeeded();
+int  pinRemainSec();
 
 void drawSetupScreen() {
   if (!screenOK) return;
+  refreshPinIfNeeded();
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.print("WiFi SETUP");
-  display.setTextSize(2);
-  display.setCursor(0, 16);
-  display.print("AIBox-Setup");
-  display.setTextSize(1);
-  display.setCursor(0, 40);
-  display.print("join it, then open");
-  display.setCursor(0, 52);
+
+  /* 第一行: 请连 + 热点名 */
+  drawZhText("请连接", 0, 0, false);
+  display.setCursor(52, 4);
+  display.print("esp32-S3");
+
+  /* 第二行: 密码 123456 */
+  drawZhText("密码", 0, 16, false);
+  display.setCursor(36, 20);
+  display.print("123456");
+
+  /* 第三行: 打开 192.168.4.1 */
+  drawZhText("打开", 0, 32, false);
+  display.setCursor(36, 36);
   display.print("192.168.4.1");
+
+  /* 底部: 配对码(白底黑字), 只放数字和秒数, 不放英文 */
+  display.fillRect(0, 50, 128, 14, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(2);
+  display.setCursor(2, 52);
+  display.print(g_pin);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(62, 53);
+  display.print(pinRemainSec());
+  display.print("s");
+  display.setTextColor(SSD1306_WHITE);
+
   display.display();
 }
+
+/* ================== v56: 4 位配对码 ==================
+   板子随机生成 4 位数字, 每 60 秒换一个, 屏幕显示。
+   手机进配置页要填对才能用 —— 别人连上热点也看不到你板子屏幕。
+   不需要网络对时, 纯本地计数, 所以离线也能用。 */
+
+String makePin() {
+  uint32_t r = esp_random() % 10000;
+  char b[8];
+  snprintf(b, sizeof(b), "%04u", (unsigned)r);
+  return String(b);
+}
+
+void refreshPinIfNeeded() {
+  if (g_pin.length() == 0 || millis() - g_pinEpoch >= 60000UL) {
+    g_pin = makePin();
+    g_pinEpoch = millis();
+    Serial.printf(">>> pair code: %s\n", g_pin.c_str());
+  }
+}
+
+int pinRemainSec() {
+  unsigned long el = millis() - g_pinEpoch;
+  if (el >= 60000UL) return 60;
+  return 60 - (int)(el / 1000);
+}
+
+/* ================== v56: 恢复码 ==================
+   内置固定恢复码(代码里明写), 忘了 4 位配对码时用它进。
+   可以在设置页修改, 改完存 NVS, 刷固件不丢。 */
+
+#define DEFAULT_RECOVER  "AIBox888"   /* 出厂默认恢复码, 设置页可改 */
+
+void loadRecovery() {
+  prefs.begin("aibox", true);
+  g_recover = prefs.getString("recover", "");
+  prefs.end();
+  if (g_recover.length() < 4) {
+    g_recover = DEFAULT_RECOVER;
+    prefs.begin("aibox", false);
+    prefs.putString("recover", g_recover);
+    prefs.end();
+  }
+  Serial.printf(">>> recovery code: %s\n", g_recover.c_str());
+}
+
+/* 显示成 ABCD-EFGH 方便抄 */
+String recoverPretty() {
+  if (g_recover.length() == 8) return g_recover.substring(0, 4) + "-" + g_recover.substring(4);
+  return g_recover;
+}
+
 
 void runConfigPortal() {
   Serial.println(">>> no WiFi, starting config portal");
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID);
+  WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print(">>> AP IP: "); Serial.println(WiFi.softAPIP());
-  dnsServer.start(53, "*", WiFi.softAPIP());   /* 任何域名都跳到配置页 */
+  dnsServer.start(53, "*", WiFi.softAPIP());
 
+  /* ---- 等待输入配对码 ---- */
   cfgServer.on("/", HTTP_GET, []() {
+    refreshPinIfNeeded();
+    drawSetupScreen();
+    if (g_pinOK) { cfgServer.sendHeader("Location", "/setup"); cfgServer.send(303); return; }
+
     String h = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
     h += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-    h += "<title>AI Box WiFi</title></head><body style='font-family:sans-serif;max-width:420px;margin:20px auto;padding:0 14px'>";
-    h += "<h3>AI Box WiFi Setup</h3>";
-    h += "<form method='GET' action='/save'>";
-    h += "<p>WiFi name<br><input name='ssid' style='width:100%;padding:10px;font-size:16px' value='";
-    h += g_wifiSsid; h += "'></p>";
-    h += "<p>Password<br><input name='pass' type='password' style='width:100%;padding:10px;font-size:16px'></p>";
-    h += "<button style='padding:12px 30px;font-size:16px'>CONNECT</button></form>";
-    h += "<p style='color:#888;font-size:13px'>After saving the box restarts and joins your WiFi.</p>";
-    h += "</body></html>";
+    h += "<title>AI 盒子</title><style>";
+    h += "*{box-sizing:border-box}body{font-family:-apple-system,system-ui,sans-serif;";
+    h += "max-width:420px;margin:0 auto;padding:20px;background:#f2f3f5;color:#1a1a1a}";
+    h += "h2{margin:10px 0 6px;font-size:24px}.sub{color:#8a94a6;font-size:13px;margin-bottom:24px}";
+    h += ".card{background:#fff;border-radius:12px;padding:20px}";
+    h += ".lbl{font-size:14px;color:#5a6478;margin-bottom:12px}";
+    h += "input{width:100%;padding:16px;font-size:28px;letter-spacing:12px;text-align:center;";
+    h += "border:2px solid #e4e8ee;border-radius:10px;background:#fafbfc}";
+    h += "button{width:100%;padding:15px;font-size:17px;border:0;border-radius:10px;";
+    h += "background:#1f6feb;color:#fff;margin-top:14px}";
+    h += ".warn{background:#fdeaea;color:#b03a3a;padding:10px;border-radius:6px;font-size:13px;margin-bottom:12px}";
+    h += ".tip{color:#a3abb8;font-size:12px;line-height:1.7;margin-top:16px}";
+    h += "</style></head><body>";
+    h += "<h2>AI 盒子</h2><div class='sub'>esp32-S3开发版 &middot; 固件 v" + String(FW_VER) + "</div>";
+    h += "<div class='card'>";
+    if (cfgServer.hasArg("err")) h += "<div class='warn'>配对码不对，或已过期</div>";
+    h += "<div class='lbl'>请输入<b>板子屏幕</b>上显示的 4 位数字<br><span style='color:#a3abb8;font-size:12px'>忘了配对码？可输入恢复码(如 AIBox888)</span></div>";
+    h += "<form method='GET' action='/pin'>";
+    h += "<input name='p' maxlength='10' style='letter-spacing:6px;font-size:22px' autocomplete='off' autofocus>";
+    h += "<button type='submit'>进入设置</button></form>";
+    h += "<div class='tip'>数字每 60 秒自动更换。<br>";
+    h += "若本页打不开，请关闭手机移动数据后重试。</div>";
+    h += "</div></body></html>";
     cfgServer.send(200, "text/html", h);
   });
 
-  cfgServer.on("/save", HTTP_GET, []() {
+  cfgServer.on("/pin", HTTP_GET, []() {
+    refreshPinIfNeeded();
+    String p = cfgServer.arg("p");
+    p.trim();
+    p.toUpperCase();
+    p.replace("-", "");
+    String want = g_recover;
+    want.toUpperCase();
+    if (p == g_pin || (p.length() >= 4 && p == want)) {
+      g_pinOK = true;
+      Serial.printf(">>> pair code OK (%s)\n", p == g_pin ? "4-digit" : "RECOVERY");
+      cfgServer.sendHeader("Location", "/setup");
+      cfgServer.send(303);
+    } else {
+      Serial.printf(">>> pair code FAIL (got %s)\n", p.c_str());
+      cfgServer.sendHeader("Location", "/?err=1");
+      cfgServer.send(303);
+    }
+  });
+
+  /* ---- 主设置页: 密钥 + WiFi 列表 ---- */
+  cfgServer.on("/setup", HTTP_GET, []() {
+    if (!g_pinOK) { cfgServer.sendHeader("Location", "/"); cfgServer.send(303); return; }
+    refreshPinIfNeeded();
+    drawSetupScreen();
+    cfgServer.send(200, "text/html", buildConfigHtml());
+  });
+
+  cfgServer.on("/savekey", HTTP_POST, []() {
+    if (!g_pinOK) { cfgServer.send(403, "text/plain", "locked"); return; }
+    String k = cfgServer.arg("key");
+    k.trim();
+    if (k.length() >= 20) {
+      prefs.begin("aibox", false);
+      prefs.putString("key", k);
+      prefs.end();
+      g_key = k;
+      Serial.println(">>> key saved via portal");
+    }
+    cfgServer.sendHeader("Location", "/setup?msg=key");
+    cfgServer.send(303);
+  });
+
+  cfgServer.on("/addwifi", HTTP_POST, []() {
+    if (!g_pinOK) { cfgServer.send(403, "text/plain", "locked"); return; }
     String ssid = cfgServer.arg("ssid");
     String pass = cfgServer.arg("pass");
     ssid.trim();
-    if (ssid.length() == 0) {
-      cfgServer.send(200, "text/html", "<h3>WiFi name is empty</h3><p><a href='/'>back</a></p>");
-      return;
-    }
-    saveWifiCred(ssid, pass);
+    if (ssid.length() == 0) { cfgServer.sendHeader("Location", "/setup?msg=bad"); cfgServer.send(303); return; }
+    if (g_savedN >= MAX_WIFI) { cfgServer.sendHeader("Location", "/setup?msg=full"); cfgServer.send(303); return; }
+    addWifi(ssid, pass);
     cfgServer.send(200, "text/html",
-      "<h3>Saved!</h3><p>Box is restarting and will join your WiFi.</p>");
+      "<meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
+      "<h3>WiFi 已保存</h3><p>盒子正在重启并连接…</p></body>");
     if (screenOK) {
       display.clearDisplay(); display.setTextSize(1);
       display.setCursor(0, 20); display.print("SAVED");
@@ -1952,15 +2303,140 @@ void runConfigPortal() {
     ESP.restart();
   });
 
+  cfgServer.on("/delwifi", HTTP_POST, []() {
+    if (!g_pinOK) { cfgServer.send(403, "text/plain", "locked"); return; }
+    removeWifi(cfgServer.arg("i").toInt());
+    cfgServer.sendHeader("Location", "/setup?msg=del");
+    cfgServer.send(303);
+  });
+
+  cfgServer.on("/saverecover", HTTP_POST, []() {
+    if (!g_pinOK) { cfgServer.send(403, "text/plain", "locked"); return; }
+    String r = cfgServer.arg("r");
+    r.trim();
+    r.toUpperCase();
+    if (r.length() >= 4) {
+      prefs.begin("aibox", false);
+      prefs.putString("recover", r);
+      prefs.end();
+      g_recover = r;
+      Serial.printf(">>> recovery code changed: %s\n", r.c_str());
+    }
+    cfgServer.sendHeader("Location", "/setup?msg=key");
+    cfgServer.send(303);
+  });
+
   cfgServer.begin();
   drawSetupScreen();
 
-  /* 一直停在配网模式, 直到有人填好 (填好后自动重启) */
+  /* v56: 按住 K4 三秒 = 放弃配网, 下次开机跳过 */
+  unsigned long k4t = 0;
   while (true) {
     dnsServer.processNextRequest();
     cfgServer.handleClient();
+
+    /* 配对码到期就刷新, 并重绘屏幕 */
+    static String lastPin;
+    refreshPinIfNeeded();
+    if (lastPin != g_pin) {
+      lastPin = g_pin;
+      drawSetupScreen();
+    }
+
+    if (digitalRead(BTN_TALK) == LOW) {
+      if (k4t == 0) k4t = millis();
+      if (millis() - k4t > 3000) {
+        prefs.begin("aibox", false);
+        prefs.putBool("skipsetup", true);
+        prefs.end();
+        if (screenOK) {
+          display.clearDisplay(); display.setTextSize(1);
+          display.setCursor(0, 20); display.print("SKIP SETUP");
+          display.setCursor(0, 36); display.print("rebooting...");
+          display.display();
+        }
+        delay(900);
+        ESP.restart();
+      }
+    } else {
+      k4t = 0;
+    }
     delay(2);
   }
+}
+
+/* ================== v56: 强制回滚到另一份固件 ==================
+   default_8MB 是双分区(ota_0 / ota_1), OTA 总是写往"当前没在跑"的那个。
+   所以另一个分区里存着上一次刷进去的固件。
+   直接切启动分区 + 重启, 不需要网络、不需要电脑。 */
+bool rollbackToOtherPartition() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  const esp_partition_t* other   = esp_ota_get_next_update_partition(NULL);
+  Serial.printf(">>> running: %s\n", running ? running->label : "?");
+  Serial.printf(">>> other  : %s\n", other ? other->label : "?");
+  if (!other) { Serial.println(">>> rollback: no other partition"); return false; }
+
+  esp_app_desc_t desc;
+  esp_err_t e = esp_ota_get_partition_description(other, &desc);
+  if (e != ESP_OK) {
+    Serial.printf(">>> rollback: other partition invalid (err %d)\n", e);
+    return false;
+  }
+  Serial.printf(">>> other holds: v%s\n", desc.version);
+
+  if (screenOK) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 8);  display.print("ROLLBACK");
+    display.setCursor(0, 24); display.print("to firmware v");
+    display.print(desc.version);
+    display.setCursor(0, 52); display.print("rebooting...");
+    display.display();
+  }
+  delay(1200);
+
+  if (esp_ota_set_boot_partition(other) != ESP_OK) {
+    Serial.println(">>> rollback: set boot FAILED");
+    return false;
+  }
+  Serial.println(">>> rollback: rebooting");
+  delay(300);
+  ESP.restart();
+  return true;
+}
+
+/* ================== v56: 回滚确认页 ================== */
+void drawRollbackConfirm() {
+  if (!screenOK) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print("ROLLBACK");
+
+  const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+  esp_app_desc_t desc;
+  display.setCursor(0, 14);
+  if (other && esp_ota_get_partition_description(other, &desc) == ESP_OK) {
+    display.print("to v");
+    display.print(desc.version);
+    display.setCursor(0, 26);
+    display.print(other->label);
+  } else {
+    display.print("no backup!");
+    display.setCursor(0, 26);
+    display.print("in other slot");
+  }
+  display.setCursor(0, 44);
+  display.print(menuSub == 0 ? ">" : " ");
+  display.setCursor(8, 44);
+  display.print("CANCEL");
+  display.setCursor(0, 54);
+  display.print(menuSub == 1 ? ">" : " ");
+  display.setCursor(8, 54);
+  display.print("DO IT");
+  display.display();
 }
 
 /* ================== setup ================== */
@@ -1970,8 +2446,22 @@ void setup() {
   Serial.println();
   Serial.printf("=== AI Box v%d ===\n", FW_VER);
 
+  /* v56: 开机先看有没有按住键 —— 必须放在最前面,
+     因为后面校准/自检要十几秒, 那时早松手了。
+       K3(#)   按住 = 强制进配网
+       K1(+K4) 同时按住 = 强制回滚到另一份固件 */
+  pinMode(BTN_REPLAY, INPUT_PULLUP);
+  pinMode(BTN_K1,     INPUT_PULLUP);
+  pinMode(BTN_TALK,   INPUT_PULLUP);
+  delay(80);
+  bool forceSetup    = (digitalRead(BTN_REPLAY) == LOW);
+  bool forceRollback = (digitalRead(BTN_K1) == LOW && digitalRead(BTN_TALK) == LOW);
+  if (forceSetup)    Serial.println(">>> K3 held at boot: force config portal");
+  if (forceRollback) Serial.println(">>> K1+K4 held at boot: force rollback");
+
   loadSettings();                       /* v50: 密钥/亮度/音量/走马灯 从 NVS 读入 */
   loadWifiCred();                       /* v55: NVS 里配过网的话优先用 */
+  loadRecovery();                       /* v56: 恢复码(忘了配对码时用) */
 
   pixels.begin();
   pixels.clear();
@@ -2019,15 +2509,39 @@ void setup() {
   playSelfTest();
   delay(600);
 
+  /* v56: 开机时按住了 K1+K4 -> 强制回滚 (不管 WiFi/其他状态) */
+  if (forceRollback) {
+    while (digitalRead(BTN_K1) == LOW || digitalRead(BTN_TALK) == LOW) delay(20);
+    if (!rollbackToOtherPartition()) {
+      screen2("NO BACKUP", "in other slot");
+      delay(2500);
+    }
+  }
+
+  /* v56: 开机时按住了 K3 -> 跳过联网, 直接进配网 (不管 WiFi 是否正常) */
+  if (forceSetup) {
+    while (digitalRead(BTN_REPLAY) == LOW) delay(20);   /* 等松手 */
+    WiFi.mode(WIFI_AP);
+    runConfigPortal();               /* 不返回, 填好会自己重启 */
+  }
+
   /* WiFi */
   if (!connectWiFi()) {
-    /* v55: 重试两轮仍失败 -> 开热点让手机配网 (以前是死等, 出门在外没救) */
-    screen2("WiFi FAIL", "retrying...");
-    for (int r = 0; r < 2 && !wifiReady; r++) {
-      delay(3000);
-      if (connectWiFi()) break;
+    /* v56: 上次按 K4 跳过了配网 -> 这次不再开热点, 直接离线进主循环 */
+    bool skipSetup = false;
+    prefs.begin("aibox", true);
+    skipSetup = prefs.getBool("skipsetup", false);
+    prefs.end();
+
+    if (skipSetup) {
+      Serial.println(">>> skipconfig flagged: booting offline (menu still works)");
+      screen2("OFFLINE MODE", "K3 = menu");
+      delay(1500);
+    } else {
+      screen2("WiFi FAIL", "K3=setup");
+      delay(800);
+      runConfigPortal();               /* 不返回, 填好会自己重启 */
     }
-    if (!wifiReady) runConfigPortal();   /* 不返回, 填好会自己重启 */
   }
   screen2("WiFi OK", WiFi.localIP().toString().c_str());
   delay(600);
@@ -2149,7 +2663,7 @@ void replayLast() {
         长按 K3(>0.8秒)=退出菜单, 12 秒无操作自动退出并保存。
    菜单项: BRIGHT 屏幕亮度 / VOLUME 喇叭音量 / LED 走马灯 /
            REPLAY 重播 / UPDATE 检查更新(从电脑或 GitHub)。 */
-#define MENU_ITEMS 5
+#define MENU_ITEMS 6
 static bool k1Was = false, k2Was = false, k3Was = false;
 static unsigned long k3DownMs = 0;
 static bool k3Fired = false;
@@ -2160,7 +2674,8 @@ const char* menuName(int i) {
     case 1:  return "VOLUME";
     case 2:  return "LED";
     case 3:  return "REPLAY";
-    default: return "UPDATE";
+    case 4:  return "UPDATE";
+    default: return "ROLLBACK";
   }
 }
 
@@ -2181,7 +2696,7 @@ void menuValue(char* buf, int i) {
 int g_menuSel = 0;   /* 当前设置项里光标指向的选项下标 (按 K3 才生效) */
 
 /* ============ v54 中文菜单点阵字库 (16x16, 文泉驿正黑提取) ============
-   34 个字, 共 1088 字节。bit15=最左像素。 */
+   68 个字, 共 2176 字节。bit15=最左像素。 */
 static const uint16_t ZH_MENU_FONT[][16] = {
   { 0x0000, 0x0000, 0x0000, 0x0C20, 0x7FFE, 0x0C20, 0x0020, 0x3FF8, 0x0208, 0x3388, 0x18B0, 0x0980, 0x7FFE, 0x03C0, 0x07A0, 0x1D98 }, /* 菜 */
   { 0x0000, 0x0000, 0x0000, 0x0820, 0x0C20, 0x0660, 0x1FF8, 0x1108, 0x1188, 0x1FF8, 0x1108, 0x1FF8, 0x1108, 0x0180, 0x7FFE, 0x0100 }, /* 单 */
@@ -2216,7 +2731,41 @@ static const uint16_t ZH_MENU_FONT[][16] = {
   { 0x0000, 0x0000, 0x0000, 0x63F8, 0x3208, 0x0318, 0x0308, 0x7208, 0x13F8, 0x1204, 0x13D8, 0x1270, 0x1330, 0x13D8, 0x1384, 0x3C00 }, /* 退 */
   { 0x0000, 0x0000, 0x0000, 0x0100, 0x0100, 0x2108, 0x2108, 0x2108, 0x2108, 0x3FF8, 0x0100, 0x4108, 0x410C, 0x410C, 0x410C, 0x7FFC }, /* 出 */
   { 0x0000, 0x0000, 0x0000, 0x0180, 0x0100, 0x0100, 0x0100, 0x0100, 0x0180, 0x01FC, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0180 }, /* 上 */
-  { 0x0000, 0x0000, 0x0000, 0x0000, 0xFFFE, 0x0100, 0x0100, 0x0100, 0x01C0, 0x0160, 0x0138, 0x0108, 0x0100, 0x0100, 0x0100, 0x0100 }  /* 下 */
+  { 0x0000, 0x0000, 0x0000, 0x0000, 0xFFFE, 0x0100, 0x0100, 0x0100, 0x01C0, 0x0160, 0x0138, 0x0108, 0x0100, 0x0100, 0x0100, 0x0100 }, /* 下 */
+  { 0x0000, 0x0000, 0x0000, 0x0000, 0x3FFC, 0x0100, 0x0100, 0x0100, 0x7FFE, 0x0360, 0x0340, 0x0340, 0x0240, 0x0640, 0x0440, 0x1843 }, /* 无 */
+  { 0x0000, 0x0000, 0x0000, 0x1050, 0x1858, 0x3048, 0x247C, 0x4DC0, 0xF840, 0x18FC, 0x3340, 0x6068, 0x7C38, 0x0030, 0x0672, 0x71DA }, /* 线 */
+  { 0x0000, 0x0000, 0x0000, 0x0100, 0x7FFE, 0x4102, 0x4122, 0x3DE0, 0x2CCC, 0x659E, 0x4712, 0x1FF0, 0x7180, 0x1188, 0x1188, 0x1188 }, /* 密 */
+  { 0x0000, 0x0000, 0x0000, 0x00F8, 0x7C0C, 0x30CC, 0x30CC, 0x2088, 0x3C88, 0x6488, 0x64FE, 0x6402, 0x2402, 0x27FE, 0x3C02, 0x2402 }, /* 码 */
+  { 0x0000, 0x0000, 0x0000, 0x0040, 0x60C0, 0x32C2, 0x13FE, 0x0120, 0x0320, 0xF3FC, 0x3020, 0x3020, 0x37FE, 0x3020, 0x3020, 0x3020 }, /* 连 */
+  { 0x0000, 0x0000, 0x0000, 0x1040, 0x1060, 0x13FC, 0x1188, 0x7890, 0x13FE, 0x1040, 0x18C0, 0xF7FE, 0x1098, 0x1190, 0x10F0, 0x1078 }, /* 接 */
+  { 0x0000, 0x0000, 0x0000, 0x003C, 0x1C06, 0x1406, 0x7F06, 0x5506, 0x553E, 0x5560, 0x7760, 0x6360, 0x6160, 0x7F60, 0x4161, 0x4163 }, /* 配 */
+  { 0x0000, 0x0000, 0x0000, 0x0008, 0x0008, 0x7E08, 0x2208, 0x22FE, 0x3608, 0x1488, 0x1CC8, 0x0C48, 0x1C08, 0x1608, 0x2208, 0x6008 }, /* 对 */
+  { 0x0000, 0x0000, 0x0000, 0x2030, 0x31F8, 0x1118, 0x0118, 0x0118, 0xF30E, 0x37F8, 0x3198, 0x3098, 0x30D0, 0x3470, 0x3860, 0x31D8 }, /* 设 */
+  { 0x0000, 0x0000, 0x0000, 0x3FFC, 0x2644, 0x3FFC, 0x0100, 0x7FFE, 0x0100, 0x1FF0, 0x1810, 0x1FF0, 0x1810, 0x1FF0, 0x1810, 0x1810 }, /* 置 */
+  { 0x0000, 0x0000, 0x0000, 0x0C10, 0x7810, 0x5010, 0x109C, 0x7C94, 0x1092, 0x1893, 0x3D90, 0x3716, 0x7216, 0xD00C, 0x1008, 0x1030 }, /* 秒 */
+  { 0x0000, 0x0000, 0x0000, 0x4040, 0x67FE, 0x2040, 0x23FC, 0x0040, 0x07FE, 0x7000, 0x33F8, 0x3208, 0x33F8, 0x3A08, 0x3BF8, 0x3208 }, /* 请 */
+  { 0x0000, 0x0000, 0x0000, 0x2040, 0x2060, 0xF8B0, 0x6198, 0x53FE, 0x5600, 0x5380, 0x7E54, 0x13D4, 0x13D4, 0xFA54, 0x13D4, 0x1244 }, /* 输 */
+  { 0x0000, 0x0000, 0x0000, 0x0600, 0x0300, 0x0080, 0x00C0, 0x01C0, 0x01C0, 0x0140, 0x0360, 0x0220, 0x0620, 0x0430, 0x0810, 0x1818 }, /* 入 */
+  { 0x0000, 0x0000, 0x0000, 0x3FF8, 0x3980, 0x0180, 0x0180, 0x3FFC, 0x0180, 0x0180, 0x0180, 0xFFFE, 0x0180, 0x0180, 0x0180, 0x0180 }, /* 手 */
+  { 0x0000, 0x0000, 0x0000, 0x1000, 0x10F0, 0x1090, 0x1890, 0x7C90, 0x3090, 0x3890, 0x3C90, 0x7090, 0x5190, 0xD190, 0x1112, 0x1313 }, /* 机 */
+  { 0x0000, 0x0000, 0x0000, 0x3FFC, 0x0180, 0x1FF8, 0x0300, 0x0200, 0x7FFE, 0x0400, 0x0FF8, 0x1C08, 0x37F8, 0x6408, 0x07F8, 0x0408 }, /* 看 */
+  { 0x0000, 0x0000, 0x0000, 0x1000, 0x11BC, 0x11C0, 0x7D00, 0x1900, 0x11FC, 0x394C, 0x3D48, 0x3548, 0x5138, 0x5130, 0xD130, 0x1278 }, /* 板 */
+  { 0x0000, 0x0000, 0x0000, 0x1FF0, 0x1FF8, 0x0060, 0x00C0, 0x0180, 0x0100, 0x7FFE, 0xFFFE, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100 }, /* 子 */
+  { 0x0000, 0x0000, 0x0000, 0x1FFC, 0x1004, 0x1004, 0x1FFC, 0x1310, 0x11B0, 0x17FC, 0x1110, 0x1110, 0x1FFE, 0x1130, 0x3110, 0x2310 }, /* 屏 */
+  { 0x0000, 0x0000, 0x0000, 0x0440, 0x7FFE, 0x0440, 0x0FF0, 0x1810, 0x1FF0, 0x1FF0, 0x0300, 0x7FFE, 0x0D30, 0x1FF8, 0x791E, 0x0930 }, /* 幕 */
+  { 0x0000, 0x0000, 0x0000, 0x0800, 0x0BFC, 0x1B0C, 0x130C, 0x330C, 0x33FC, 0x7060, 0xD060, 0x17FE, 0x10F0, 0x11F0, 0x1368, 0x1666 }, /* 保 */
+  { 0x0000, 0x0000, 0x0000, 0x0100, 0x0300, 0x7FFE, 0x0600, 0x0400, 0x0DFC, 0x1818, 0x1830, 0x3820, 0xDBFE, 0x1820, 0x1820, 0x1820 }, /* 存 */
+  { 0x0000, 0x0000, 0x0000, 0x3BC2, 0x2EC2, 0x2E42, 0x2E5A, 0x2E5A, 0x2E5A, 0x7FFA, 0x2E5A, 0x2E5A, 0x2E5A, 0x2E5A, 0x2E42, 0x6EC2 }, /* 删 */
+  { 0x0000, 0x0000, 0x0000, 0x0060, 0x7860, 0x48F0, 0x5098, 0x510E, 0x57FE, 0x5C60, 0x4820, 0x4BFE, 0x4820, 0x4928, 0x5B2C, 0x5226 }, /* 除 */
+  { 0x0000, 0x0000, 0x0000, 0x2000, 0x23F8, 0x1080, 0x04C4, 0xC1A0, 0x6130, 0x0318, 0x16CE, 0x1CC2, 0x1AE8, 0x22F4, 0x24D6, 0x64D2 }, /* 添 */
+  { 0x0000, 0x0000, 0x0000, 0x1800, 0x1800, 0x187C, 0x7F64, 0x1944, 0x1944, 0x1944, 0x1144, 0x1144, 0x1144, 0x3144, 0x2164, 0x217C }, /* 加 */
+  { 0x0000, 0x0000, 0x0000, 0x2080, 0x2080, 0x2180, 0x37FE, 0xF920, 0xA920, 0xA3A4, 0x23AC, 0x27B8, 0x2570, 0x3C70, 0x20D0, 0x2088 }, /* 恢 */
+  { 0x0000, 0x0000, 0x0000, 0x0800, 0x0FFC, 0x1800, 0x3FF0, 0x6810, 0x0FF0, 0x0810, 0x0FF0, 0x0600, 0x0FF0, 0x1A60, 0x31C0, 0x01C0 }, /* 复 */
+  { 0x0000, 0x0000, 0x0000, 0x3FFC, 0x6184, 0x4104, 0x4104, 0x5FF4, 0x4104, 0x4104, 0x47E4, 0x4424, 0x4424, 0x47E4, 0x4424, 0x4004 }, /* 固 */
+  { 0x0000, 0x0000, 0x0000, 0x0820, 0x0920, 0x1B20, 0x1320, 0x33FE, 0x3620, 0x7420, 0xD020, 0x17FE, 0x1020, 0x1020, 0x1020, 0x1020 }, /* 件 */
+  { 0x0000, 0x0000, 0x0000, 0x0180, 0x1FFC, 0x1804, 0x1004, 0x1004, 0x1FFC, 0x1000, 0x1000, 0x13FC, 0x1206, 0x1206, 0x1206, 0x3206 }, /* 启 */
+  { 0x0000, 0x0000, 0x0000, 0x0000, 0x3FF8, 0x0008, 0x0008, 0x2008, 0x2008, 0x3FF8, 0x2008, 0x2000, 0x2000, 0x2002, 0x2002, 0x2002 }, /* 已 */
+  { 0x0000, 0x0000, 0x0000, 0x0300, 0x7FFC, 0x4006, 0x4006, 0x1FF0, 0x0000, 0x0000, 0x7FFE, 0x0640, 0x0440, 0x0440, 0x0442, 0x0842 }  /* 完 */
 };
 static const struct { uint8_t b[3]; uint8_t idx; } ZH_MENU_MAP[] = {
   { {0xE8, 0x8F, 0x9C}, 0 }, /* 菜 */
@@ -2252,9 +2801,43 @@ static const struct { uint8_t b[3]; uint8_t idx; } ZH_MENU_MAP[] = {
   { {0xE9, 0x80, 0x80}, 30 }, /* 退 */
   { {0xE5, 0x87, 0xBA}, 31 }, /* 出 */
   { {0xE4, 0xB8, 0x8A}, 32 }, /* 上 */
-  { {0xE4, 0xB8, 0x8B}, 33 }  /* 下 */
+  { {0xE4, 0xB8, 0x8B}, 33 }, /* 下 */
+  { {0xE6, 0x97, 0xA0}, 34 }, /* 无 */
+  { {0xE7, 0xBA, 0xBF}, 35 }, /* 线 */
+  { {0xE5, 0xAF, 0x86}, 36 }, /* 密 */
+  { {0xE7, 0xA0, 0x81}, 37 }, /* 码 */
+  { {0xE8, 0xBF, 0x9E}, 38 }, /* 连 */
+  { {0xE6, 0x8E, 0xA5}, 39 }, /* 接 */
+  { {0xE9, 0x85, 0x8D}, 40 }, /* 配 */
+  { {0xE5, 0xAF, 0xB9}, 41 }, /* 对 */
+  { {0xE8, 0xAE, 0xBE}, 42 }, /* 设 */
+  { {0xE7, 0xBD, 0xAE}, 43 }, /* 置 */
+  { {0xE7, 0xA7, 0x92}, 44 }, /* 秒 */
+  { {0xE8, 0xAF, 0xB7}, 45 }, /* 请 */
+  { {0xE8, 0xBE, 0x93}, 46 }, /* 输 */
+  { {0xE5, 0x85, 0xA5}, 47 }, /* 入 */
+  { {0xE6, 0x89, 0x8B}, 48 }, /* 手 */
+  { {0xE6, 0x9C, 0xBA}, 49 }, /* 机 */
+  { {0xE7, 0x9C, 0x8B}, 50 }, /* 看 */
+  { {0xE6, 0x9D, 0xBF}, 51 }, /* 板 */
+  { {0xE5, 0xAD, 0x90}, 52 }, /* 子 */
+  { {0xE5, 0xB1, 0x8F}, 53 }, /* 屏 */
+  { {0xE5, 0xB9, 0x95}, 54 }, /* 幕 */
+  { {0xE4, 0xBF, 0x9D}, 55 }, /* 保 */
+  { {0xE5, 0xAD, 0x98}, 56 }, /* 存 */
+  { {0xE5, 0x88, 0xA0}, 57 }, /* 删 */
+  { {0xE9, 0x99, 0xA4}, 58 }, /* 除 */
+  { {0xE6, 0xB7, 0xBB}, 59 }, /* 添 */
+  { {0xE5, 0x8A, 0xA0}, 60 }, /* 加 */
+  { {0xE6, 0x81, 0xA2}, 61 }, /* 恢 */
+  { {0xE5, 0xA4, 0x8D}, 62 }, /* 复 */
+  { {0xE5, 0x9B, 0xBA}, 63 }, /* 固 */
+  { {0xE4, 0xBB, 0xB6}, 64 }, /* 件 */
+  { {0xE5, 0x90, 0xAF}, 65 }, /* 启 */
+  { {0xE5, 0xB7, 0xB2}, 66 }, /* 已 */
+  { {0xE5, 0xAE, 0x8C}, 67 }  /* 完 */
 };
-#define ZH_MENU_N 34
+#define ZH_MENU_N 68
 
 
 /* 查 UTF-8 三字节 -> 汉字下标, 找不到返回 -1 */
@@ -2290,6 +2873,37 @@ int drawZhText(const char* s, int x, int y, bool invert) {
   return n * 16;
 }
 
+/* v56: 混排绘制 —— 中文字用点阵, ASCII 用内置小字.
+   返回占用宽度. */
+int drawMixed(const char* s, int x, int y, bool invert) {
+  if (invert) {
+    /* 先估宽: 中文16px, 英文6px */
+    int w = 0;
+    for (const char* p = s; *p; ) {
+      if ((uint8_t)*p >= 0xE0) { w += 16; p += 3; }
+      else { w += 6; p++; }
+    }
+    display.fillRect(x - 1, y - 1, w + 2, 18, SSD1306_WHITE);
+  }
+  int cx = x;
+  display.setTextColor(invert ? SSD1306_BLACK : SSD1306_WHITE);
+  for (const char* p = s; *p; ) {
+    if ((uint8_t)*p >= 0xE0) {
+      drawZh16(zhMenuIndex((const uint8_t*)p), cx, y, invert);
+      cx += 16;
+      p += 3;
+    } else {
+      char b[2] = { *p, 0 };
+      display.setCursor(cx, y + 4);
+      display.print(b);
+      cx += 6;
+      p++;
+    }
+  }
+  display.setTextColor(SSD1306_WHITE);
+  return cx - x;
+}
+
 /* 高亮画一格: sel=true 用白底黑字 (反色) */
 void drawItem(const char* txt, int x, int y, int w, bool sel) {
   if (sel) {
@@ -2323,19 +2937,19 @@ void drawMenu() {
   if (menuActive == 1) {
     /* 主菜单: 标题 + 5 项, 光标项白底黑字
        左侧中文名(16x16), 右侧英文值(小字) */
-    /* 主菜单: 5 项, 每项 11px 高, 简化名用英文(16x16 中文放不下 5 项) */
+    /* 主菜单: 6 项, 每项 9px 高 */
     display.setCursor(0, 0);
     display.print("MENU");
     display.setCursor(94, 0);
     display.print("#=exit");
     for (int i = 0; i < MENU_ITEMS; i++) {
-      int y = 11 + i * 10;
+      int y = 10 + i * 9;
       bool sel = (menuCursor == i);
       char v[12];
       menuValue(v, i);
       char line[24];
       snprintf(line, sizeof(line), "%s", menuName(i));
-      if (sel) display.fillRect(0, y - 1, 128, 10, SSD1306_WHITE);
+      if (sel) display.fillRect(0, y - 1, 128, 9, SSD1306_WHITE);
       display.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE);
       display.setCursor(2, y);
       display.print(line);
@@ -2439,6 +3053,10 @@ void menuEnterShort() {
       menuActive = 3;
       menuSub = 0;
       drawMenu();
+    } else if (menuCursor == 5) {   /* v56: ROLLBACK 强制回滚 */
+      menuActive = 4;
+      menuSub = 0;
+      drawRollbackConfirm();
     } else {                        /* 其余: 进设置项, 光标停在当前值 */
       g_menuSel = menuCurrentOpt();
       menuActive = 2;
@@ -2452,6 +3070,19 @@ void menuEnterShort() {
     bool pc = (menuSub == 0);
     menuActive = 0;
     updateFromSource(pc);
+  } else if (menuActive == 4) {     /* v56: 回滚确认页 */
+    if (menuSub == 1) {             /* 选了 DO IT -> 真回滚(会重启) */
+      menuActive = 0;
+      if (!rollbackToOtherPartition()) {
+        screen2("ROLLBACK FAIL", "no backup");
+        delay(1800);
+        showIdle();
+      }
+    } else {                        /* CANCEL */
+      menuActive = 1;
+      menuCursor = 5;
+      drawMenu();
+    }
   }
 }
 
@@ -2465,6 +3096,7 @@ void menuTick() {
       if (menuActive == 1)      { menuCursor = (menuCursor + MENU_ITEMS - 1) % MENU_ITEMS; drawMenu(); }
       else if (menuActive == 2) { menuMove(-1); drawMenu(); }
       else if (menuActive == 3) { menuSub = 0; drawMenu(); }
+      else if (menuActive == 4) { menuSub = 0; drawRollbackConfirm(); }
     }
   }
   k1Was = k1;
@@ -2478,6 +3110,7 @@ void menuTick() {
       if (menuActive == 1)      { menuCursor = (menuCursor + 1) % MENU_ITEMS; drawMenu(); }
       else if (menuActive == 2) { menuMove(1); drawMenu(); }
       else if (menuActive == 3) { menuSub = 1; drawMenu(); }
+      else if (menuActive == 4) { menuSub = 1; drawRollbackConfirm(); }
     }
   }
   k2Was = k2;
@@ -2756,10 +3389,22 @@ void loop() {
         delay(300);
       }
     }
-    else if (digitalRead(BTN_REPLAY) == LOW) {   /* K3: 进菜单 */
+    else if (digitalRead(BTN_REPLAY) == LOW) {   /* K3: 短按进菜单 / 长按3秒强制开配网热点 */
       delay(25);
       if (digitalRead(BTN_REPLAY) == LOW) {
         if (g_bright == 0) { g_bright = 2; applyBrightness(); }  /* 熄屏先点亮 */
+        /* v56: 按住 K3 满 3 秒 = 强制进配网模式(不管当前 WiFi 是否正常) */
+        unsigned long t3 = millis();
+        bool  forced = false;
+        while (digitalRead(BTN_REPLAY) == LOW) {
+          if (millis() - t3 > 3000) { forced = true; break; }
+          delay(20);
+        }
+        if (forced) {
+          Serial.println(">>> force config portal (K3 held 3s)");
+          while (digitalRead(BTN_REPLAY) == LOW) delay(20);   /* 等松手 */
+          runConfigPortal();                                  /* 不返回, 填好自动重启 */
+        }
         menuActive = 1;
         menuCursor = 0;
         menuLastMs = millis();
