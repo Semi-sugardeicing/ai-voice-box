@@ -1,6 +1,12 @@
 /*
   ========================================
-   版本: v53 (按键自检屏 + 菜单外 K1/K2 也有反应)
+   版本: v54 (菜单反色高亮 + K3 专门做确定)
+   日期: 2026-11-22
+   改动一: 菜单改成"焦点在选项上": 被选中的项显示成白底黑字(反色)。
+   改动二: 按键分工定稿 —— 菜单外 K1/K2 无反应; 菜单里 K1/K2 移动光标,
+           K3 短按=确定(保存生效), 长按 K3=退出菜单。
+   改动三: 屏幕亮度 / 喇叭音量(5档) / 走马灯(4档) 只能在菜单里改, 断电记忆。
+   上一版: v53 (按键自检屏 + 菜单外 K1/K2 也有反应)
    日期: 2026-11-22
    改动一: 同时按住 K1+K2 一秒 -> 按键自检屏, 直接显示四个键当前电平和引脚号,
            用来排查"按键没反应"到底是哪根线/哪个脚的问题。按住 K4 两秒退出。
@@ -92,7 +98,7 @@
 */
 
 /* 固件版本号 —— 必须在最前面, 首页/版本接口/更新逻辑都要用 */
-#define FW_VER       53
+#define FW_VER       54
 
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -2054,74 +2060,250 @@ void menuValue(char* buf, int i) {
   }
 }
 
+/* ================== v54: 菜单 (白底黑字反色高亮) ==================
+   按键: K1∧ 上一个 / K2∨ 下一个 / K3# 确定 / 长按 K3 退出
+   设置项改成"焦点在选项上": 每一屏都有若干选项, 选中的那个白底黑字。 */
+
+int g_menuSel = 0;   /* 当前设置项里光标指向的选项下标 (按 K3 才生效) */
+
+/* ============ v54 中文菜单点阵字库 (16x16, 文泉驿正黑提取) ============
+   34 个字, 共 1088 字节。bit15=最左像素。 */
+static const uint16_t ZH_MENU_FONT[][16] = {
+  { 0x0000, 0x0000, 0x0000, 0x0C20, 0x7FFE, 0x0C20, 0x0020, 0x3FF8, 0x0208, 0x3388, 0x18B0, 0x0980, 0x7FFE, 0x03C0, 0x07A0, 0x1D98 }, /* 菜 */
+  { 0x0000, 0x0000, 0x0000, 0x0820, 0x0C20, 0x0660, 0x1FF8, 0x1108, 0x1188, 0x1FF8, 0x1108, 0x1FF8, 0x1108, 0x0180, 0x7FFE, 0x0100 }, /* 单 */
+  { 0x0000, 0x0000, 0x0000, 0x0300, 0x7FFE, 0x0000, 0x0FF0, 0x0810, 0x0FF0, 0x0000, 0x7FFE, 0x4002, 0x47E2, 0x0420, 0x0C22, 0x0822 }, /* 亮 */
+  { 0x0000, 0x0000, 0x0000, 0x0080, 0x1FFE, 0x3210, 0x3310, 0x3FFE, 0x3210, 0x33F0, 0x3000, 0x37F8, 0x3318, 0x3110, 0x20E0, 0x20E0 }, /* 度 */
+  { 0x0000, 0x0000, 0x0000, 0x0300, 0x3FF8, 0x0830, 0x0820, 0x0C60, 0xFFFE, 0x0000, 0x0000, 0x1FF0, 0x1010, 0x1FF0, 0x1010, 0x1010 }, /* 音 */
+  { 0x0000, 0x0000, 0x0000, 0x1FF0, 0x1018, 0x1FF8, 0x1018, 0x0000, 0xFFFE, 0x1FF0, 0x1118, 0x1FF8, 0x1108, 0x1FF0, 0x0180, 0x0100 }, /* 量 */
+  { 0x0000, 0x0000, 0x0000, 0x0180, 0x0100, 0x0180, 0x1FF8, 0x0100, 0x0100, 0x7FFC, 0x0100, 0x1900, 0x1988, 0x19F8, 0x1D00, 0x1700 }, /* 走 */
+  { 0x0000, 0x0000, 0x0000, 0x0000, 0x3FF0, 0x0030, 0x0830, 0x0820, 0x0820, 0x1820, 0x1FFC, 0x0FFC, 0x0004, 0x7FE4, 0x0004, 0x0004 }, /* 马 */
+  { 0x0000, 0x0000, 0x0000, 0x1800, 0x1800, 0x19FE, 0x1A10, 0x5E10, 0x5C10, 0x5810, 0xD810, 0x1810, 0x1810, 0x1C10, 0x3610, 0x2010 }, /* 灯 */
+  { 0x0000, 0x0000, 0x0000, 0x3FF8, 0x3180, 0x0180, 0x7FFE, 0x0180, 0x3188, 0x1188, 0x1FF8, 0x1188, 0x1FF8, 0x0100, 0x3FFC, 0x0100 }, /* 重 */
+  { 0x0000, 0x0000, 0x0000, 0x103C, 0x33E0, 0x1348, 0x3158, 0x79F0, 0x10F0, 0x11F0, 0x3B4C, 0xF7FE, 0x1264, 0x136C, 0x136C, 0x1264 }, /* 播 */
+  { 0x0000, 0x0000, 0x0000, 0x1860, 0x1860, 0x18D0, 0x1898, 0x7F8E, 0x1B02, 0x3EF8, 0x3C40, 0x7964, 0x592C, 0xD9A8, 0x1898, 0x1810 }, /* 检 */
+  { 0x0000, 0x0000, 0x0000, 0x0180, 0x0180, 0x7FFE, 0x07E0, 0x1D38, 0x710C, 0x4180, 0x1810, 0x1810, 0x0FF0, 0x1810, 0x1FF0, 0x0000 }, /* 查 */
+  { 0x0000, 0x0000, 0x0000, 0x0000, 0x7FFE, 0x0100, 0x1FF8, 0x3188, 0x3108, 0x1FF8, 0x3108, 0x3FF8, 0x0180, 0x0900, 0x0700, 0x0700 }, /* 更 */
+  { 0x0000, 0x0000, 0x0000, 0x0800, 0x7F7C, 0x2260, 0x3260, 0x1E60, 0x7FFE, 0x0C6C, 0x0C6C, 0x7FEC, 0x1E4C, 0x3F4C, 0x2D4C, 0x6CCC }, /* 新 */
+  { 0x0000, 0x0000, 0x0000, 0x0820, 0x0C60, 0x06C0, 0x3FFC, 0x0100, 0x0100, 0x0100, 0x3FFE, 0x03C0, 0x01C0, 0x0240, 0x0620, 0x0C10 }, /* 关 */
+  { 0x0000, 0x0000, 0x0000, 0x1000, 0x1BFC, 0x4886, 0x4086, 0x4FF6, 0x4186, 0x4386, 0x4286, 0x4686, 0x4C86, 0x5086, 0x4086, 0x4186 }, /* 闭 */
+  { 0x0000, 0x0000, 0x0000, 0x1000, 0x10FE, 0x10FE, 0xFE10, 0x1010, 0x1010, 0x1E10, 0x7810, 0xD010, 0x1010, 0x1010, 0x1010, 0x1010 }, /* 打 */
+  { 0x0000, 0x0000, 0x0000, 0x0000, 0x3FFC, 0x0420, 0x0420, 0x0420, 0x0420, 0x7FFE, 0x7FFE, 0x0420, 0x0420, 0x0420, 0x0C20, 0x1820 }, /* 开 */
+  { 0x0000, 0x0000, 0x0000, 0x0100, 0x0300, 0x0600, 0x3FF8, 0x2008, 0x2008, 0x3FF8, 0x2008, 0x2008, 0x3FF8, 0x3008, 0x2008, 0x3008 }, /* 自 */
+  { 0x0000, 0x0000, 0x0000, 0x0020, 0x0020, 0x3E20, 0x0020, 0x00FE, 0xFF26, 0x1826, 0x1026, 0x3626, 0x2226, 0x7F66, 0x6046, 0x00C6 }, /* 动 */
+  { 0x0000, 0x0000, 0x0000, 0x0800, 0x1800, 0x31FC, 0x2420, 0x6C20, 0xFC20, 0x1820, 0x3020, 0x6020, 0x7C20, 0x0020, 0x0620, 0x7820 }, /* 红 */
+  { 0x0000, 0x0000, 0x0000, 0x0000, 0x21F8, 0x2008, 0x49F8, 0x5808, 0xF008, 0x23FE, 0x2244, 0x434C, 0xE060, 0x00F0, 0x0F78, 0x644E }, /* 绿 */
+  { 0x0000, 0x0000, 0x0000, 0x0300, 0x7FFE, 0x0000, 0x0FF0, 0x0830, 0x0FF0, 0x0000, 0x3FFC, 0x6004, 0x67E4, 0x6C24, 0x6C24, 0x6FE4 }, /* 高 */
+  { 0x0000, 0x0000, 0x0000, 0x0100, 0x0100, 0x0100, 0x7FFC, 0x4104, 0x4104, 0x4104, 0x4104, 0x7FFC, 0x4104, 0x0100, 0x0100, 0x0100 }, /* 中 */
+  { 0x0000, 0x0000, 0x0000, 0x1000, 0x1BFC, 0x4806, 0x4006, 0x47E6, 0x4426, 0x4426, 0x47E6, 0x4426, 0x4426, 0x47E6, 0x4466, 0x4006 }, /* 间 */
+  { 0x0000, 0x0000, 0x0000, 0x0040, 0x7E40, 0x10F8, 0x1098, 0x3198, 0x21B6, 0x7D92, 0x75FE, 0x7592, 0xF5B2, 0x3592, 0x3592, 0x3D12 }, /* 确 */
+  { 0x0000, 0x0000, 0x0000, 0x0300, 0x0180, 0x7FFC, 0x4004, 0x4004, 0x3FFC, 0x0180, 0x0180, 0x1980, 0x19F8, 0x1980, 0x3980, 0x2580 }, /* 定 */
+  { 0x0000, 0x0000, 0x0000, 0x2060, 0x2160, 0x13FE, 0x0260, 0x0660, 0x0460, 0xF3FE, 0x10B0, 0x10B0, 0x11B3, 0x1112, 0x171E, 0x1C00 }, /* 选 */
+  { 0x0000, 0x0000, 0x0000, 0x1000, 0x11FC, 0x1088, 0x18D8, 0x7C70, 0x1070, 0x11BE, 0x1F20, 0x71FC, 0x1020, 0x1020, 0x17FE, 0x1020 }, /* 择 */
+  { 0x0000, 0x0000, 0x0000, 0x63F8, 0x3208, 0x0318, 0x0308, 0x7208, 0x13F8, 0x1204, 0x13D8, 0x1270, 0x1330, 0x13D8, 0x1384, 0x3C00 }, /* 退 */
+  { 0x0000, 0x0000, 0x0000, 0x0100, 0x0100, 0x2108, 0x2108, 0x2108, 0x2108, 0x3FF8, 0x0100, 0x4108, 0x410C, 0x410C, 0x410C, 0x7FFC }, /* 出 */
+  { 0x0000, 0x0000, 0x0000, 0x0180, 0x0100, 0x0100, 0x0100, 0x0100, 0x0180, 0x01FC, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0180 }, /* 上 */
+  { 0x0000, 0x0000, 0x0000, 0x0000, 0xFFFE, 0x0100, 0x0100, 0x0100, 0x01C0, 0x0160, 0x0138, 0x0108, 0x0100, 0x0100, 0x0100, 0x0100 }  /* 下 */
+};
+static const struct { uint8_t b[3]; uint8_t idx; } ZH_MENU_MAP[] = {
+  { {0xE8, 0x8F, 0x9C}, 0 }, /* 菜 */
+  { {0xE5, 0x8D, 0x95}, 1 }, /* 单 */
+  { {0xE4, 0xBA, 0xAE}, 2 }, /* 亮 */
+  { {0xE5, 0xBA, 0xA6}, 3 }, /* 度 */
+  { {0xE9, 0x9F, 0xB3}, 4 }, /* 音 */
+  { {0xE9, 0x87, 0x8F}, 5 }, /* 量 */
+  { {0xE8, 0xB5, 0xB0}, 6 }, /* 走 */
+  { {0xE9, 0xA9, 0xAC}, 7 }, /* 马 */
+  { {0xE7, 0x81, 0xAF}, 8 }, /* 灯 */
+  { {0xE9, 0x87, 0x8D}, 9 }, /* 重 */
+  { {0xE6, 0x92, 0xAD}, 10 }, /* 播 */
+  { {0xE6, 0xA3, 0x80}, 11 }, /* 检 */
+  { {0xE6, 0x9F, 0xA5}, 12 }, /* 查 */
+  { {0xE6, 0x9B, 0xB4}, 13 }, /* 更 */
+  { {0xE6, 0x96, 0xB0}, 14 }, /* 新 */
+  { {0xE5, 0x85, 0xB3}, 15 }, /* 关 */
+  { {0xE9, 0x97, 0xAD}, 16 }, /* 闭 */
+  { {0xE6, 0x89, 0x93}, 17 }, /* 打 */
+  { {0xE5, 0xBC, 0x80}, 18 }, /* 开 */
+  { {0xE8, 0x87, 0xAA}, 19 }, /* 自 */
+  { {0xE5, 0x8A, 0xA8}, 20 }, /* 动 */
+  { {0xE7, 0xBA, 0xA2}, 21 }, /* 红 */
+  { {0xE7, 0xBB, 0xBF}, 22 }, /* 绿 */
+  { {0xE9, 0xAB, 0x98}, 23 }, /* 高 */
+  { {0xE4, 0xB8, 0xAD}, 24 }, /* 中 */
+  { {0xE9, 0x97, 0xB4}, 25 }, /* 间 */
+  { {0xE7, 0xA1, 0xAE}, 26 }, /* 确 */
+  { {0xE5, 0xAE, 0x9A}, 27 }, /* 定 */
+  { {0xE9, 0x80, 0x89}, 28 }, /* 选 */
+  { {0xE6, 0x8B, 0xA9}, 29 }, /* 择 */
+  { {0xE9, 0x80, 0x80}, 30 }, /* 退 */
+  { {0xE5, 0x87, 0xBA}, 31 }, /* 出 */
+  { {0xE4, 0xB8, 0x8A}, 32 }, /* 上 */
+  { {0xE4, 0xB8, 0x8B}, 33 }  /* 下 */
+};
+#define ZH_MENU_N 34
+
+
+/* 查 UTF-8 三字节 -> 汉字下标, 找不到返回 -1 */
+int zhMenuIndex(const uint8_t* p) {
+  for (int i = 0; i < ZH_MENU_N; i++)
+    if (p[0] == ZH_MENU_MAP[i].b[0] && p[1] == ZH_MENU_MAP[i].b[1] && p[2] == ZH_MENU_MAP[i].b[2])
+      return ZH_MENU_MAP[i].idx;
+  return -1;
+}
+
+/* 画一个 16x16 汉字; fg/bg 决定正色还是反色 */
+void drawZh16(int idx, int x, int y, bool invert) {
+  if (idx < 0) return;
+  for (int r = 0; r < 16; r++) {
+    uint16_t row = ZH_MENU_FONT[idx][r];
+    for (int c = 0; c < 16; c++) {
+      bool on = (row >> (15 - c)) & 1;
+      display.drawPixel(x + c, y + r, (on != invert) ? SSD1306_WHITE : SSD1306_BLACK);
+    }
+  }
+}
+
+/* 画一串汉字(UTF-8), 反色时先铺白底; 返回占用宽度 */
+int drawZhText(const char* s, int x, int y, bool invert) {
+  int n = 0;
+  for (const char* p = s; *p; p += 3) n++;
+  if (invert) display.fillRect(x - 1, y - 1, n * 16 + 2, 18, SSD1306_WHITE);
+  int cx = x;
+  for (const char* p = s; *p; p += 3) {
+    drawZh16(zhMenuIndex((const uint8_t*)p), cx, y, invert);
+    cx += 16;
+  }
+  return n * 16;
+}
+
+/* 高亮画一格: sel=true 用白底黑字 (反色) */
+void drawItem(const char* txt, int x, int y, int w, bool sel) {
+  if (sel) {
+    display.fillRect(x, y - 1, w, 11, SSD1306_WHITE);   /* 白底 */
+    display.setTextColor(SSD1306_BLACK);                /* 黑字 */
+  } else {
+    display.setTextColor(SSD1306_WHITE);
+  }
+  display.setCursor(x, y);
+  display.print(txt);
+  display.setTextColor(SSD1306_WHITE);
+}
+
+/* 菜单项的中文名 (UTF-8) */
+const char* menuNameCn(int i) {
+  switch (i) {
+    case 0:  return "亮度";
+    case 1:  return "音量";
+    case 2:  return "走马灯";
+    case 3:  return "重播";
+    default: return "检查更新";
+  }
+}
+
 void drawMenu() {
   if (!screenOK) return;
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  if (menuActive == 2) {
-    /* 调值界面: 名字 + 大字当前值 */
-    char v[12];
+
+  if (menuActive == 1) {
+    /* 主菜单: 标题 + 5 项, 光标项白底黑字
+       左侧中文名(16x16), 右侧英文值(小字) */
+    /* 主菜单: 5 项, 每项 11px 高, 简化名用英文(16x16 中文放不下 5 项) */
     display.setCursor(0, 0);
-    display.print("SET ");
-    display.print(menuName(menuCursor));
-    menuValue(v, menuCursor);
-    display.setTextSize(2);
-    display.setCursor(0, 28);
-    display.print(v);
-    display.setTextSize(1);
-    display.setCursor(0, 56);
-    display.print("K1/K2=change  K3=ok");
-  } else if (menuActive == 3) {
-    /* 更新源选择 */
-    display.setCursor(0, 0);
-    display.print("UPDATE FROM");
-    display.setCursor(0, 20);
-    display.print(menuSub == 0 ? ">" : " ");
-    display.setCursor(8, 20);
-    display.print("PC (LAN)");
-    display.setCursor(0, 34);
-    display.print(menuSub == 1 ? ">" : " ");
-    display.setCursor(8, 34);
-    display.print("GITHUB");
-    display.setCursor(0, 56);
-    display.print("K3=ok  hold K3=exit");
-  } else {
-    /* 浏览界面: 5 行, > 为光标 */
-    display.setCursor(0, 0);
-    display.print("MENU  hold K3=exit");
+    display.print("MENU");
+    display.setCursor(94, 0);
+    display.print("#=exit");
     for (int i = 0; i < MENU_ITEMS; i++) {
-      int y = 12 + i * 10;
+      int y = 11 + i * 10;
+      bool sel = (menuCursor == i);
       char v[12];
-      display.setCursor(0, y);
-      display.print(menuCursor == i ? ">" : " ");
-      display.setCursor(8, y);
-      display.print(menuName(i));
       menuValue(v, i);
-      display.setCursor(72, y);
+      char line[24];
+      snprintf(line, sizeof(line), "%s", menuName(i));
+      if (sel) display.fillRect(0, y - 1, 128, 10, SSD1306_WHITE);
+      display.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE);
+      display.setCursor(2, y);
+      display.print(line);
+      display.setCursor(76, y);
       display.print(v);
     }
+    display.setTextColor(SSD1306_WHITE);
+  }
+  else if (menuActive == 2) {
+    /* 设置项: 中文标题 + 选项 */
+    drawZhText(menuNameCn(menuCursor), 2, 0, false);
+    display.setCursor(0, 56);
+    display.print("K1/K2 sel K3 ok");
+
+    const char* opts[5];
+    int n = 0;
+    if (menuCursor == 0) {                       /* 屏幕亮度 */
+      opts[0] = "HIGH"; opts[1] = "MID"; opts[2] = "OFF"; n = 3;
+    } else if (menuCursor == 1) {                /* 喇叭音量 */
+      static char vb[5][6];
+      for (int i = 0; i < 5; i++) { snprintf(vb[i], 6, "%d%%", (i + 1) * 20); opts[i] = vb[i]; }
+      n = 5;
+    } else if (menuCursor == 2) {                /* 走马灯 */
+      opts[0] = "AUTO"; opts[1] = "RED"; opts[2] = "GREEN"; opts[3] = "OFF"; n = 4;
+    } else {                                     /* 重播/更新: 只有一个 OK */
+      opts[0] = "OK"; n = 1;
+    }
+    int cur = g_menuSel;
+    if (cur >= n) cur = 0;
+    /* n=5: 从 y=16 起, 行距 9 -> 5行到 52; n<=4 行距 11 更宽松 */
+    int step = (n >= 5) ? 9 : 11;
+    int y0 = 16;
+    for (int i = 0; i < n; i++) {
+      drawItem(opts[i], 8, y0 + i * step, 112, (cur == i));
+    }
+  }
+  else if (menuActive == 3) {
+    /* 更新源 */
+    drawZhText("检查更新", 2, 0, false);
+    drawItem("PC (LAN)", 8, 20, 112, menuSub == 0);
+    drawItem("GITHUB",   8, 34, 112, menuSub == 1);
+    display.setCursor(0, 56);
+    display.print("K1/K2 sel K3 ok");
   }
   display.display();
 }
 
-void menuAdjust(int dir) {   /* dir: +1 加, -1 减; 改动立即生效 */
+/* 当前设置项有几个选项 */
+int menuOptionCount(int item) {
+  if (item == 0) return 3;      /* HIGH/MID/OFF */
+  if (item == 1) return 5;      /* 20..100% */
+  if (item == 2) return 4;      /* AUTO/RED/GREEN/OFF */
+  return 1;                     /* REPLAY / UPDATE: OK */
+}
+
+/* 当前设置项的光标位置(=已保存的值) */
+int menuCurrentOpt() {
+  if (menuCursor == 0) return g_bright;
+  if (menuCursor == 1) return g_volIdx;
+  if (menuCursor == 2) return g_ledMode;
+  return 0;
+}
+
+/* 光标移动一格 (只是选中, 还不生效; 按 K3 才生效) */
+void menuMove(int dir) {
+  int n = menuOptionCount(menuCursor);
+  g_menuSel = (g_menuSel + dir + n) % n;
+}
+
+/* K3 确认: 把光标位置写进设置并立即生效 */
+void menuApply() {
   if (menuCursor == 0) {
-    g_bright += dir;
-    if (g_bright < 0) g_bright = 2;
-    if (g_bright > 2) g_bright = 0;
+    g_bright = g_menuSel;
     applyBrightness();
   } else if (menuCursor == 1) {
-    g_volIdx += dir;
-    if (g_volIdx < 0) g_volIdx = 4;
-    if (g_volIdx > 4) g_volIdx = 0;
+    g_volIdx = g_menuSel;
     g_gain = 0.2f * (g_volIdx + 1);
   } else if (menuCursor == 2) {
-    g_ledMode += dir;
-    if (g_ledMode < 0) g_ledMode = 3;
-    if (g_ledMode > 3) g_ledMode = 0;
+    g_ledMode = g_menuSel;
     updatePeriodLed();
   }
+  saveSettings();
 }
 
 void menuExit() {
@@ -2143,11 +2325,13 @@ void menuEnterShort() {
       menuActive = 3;
       menuSub = 0;
       drawMenu();
-    } else {                        /* 其余: 进调值 */
+    } else {                        /* 其余: 进设置项, 光标停在当前值 */
+      g_menuSel = menuCurrentOpt();
       menuActive = 2;
       drawMenu();
     }
-  } else if (menuActive == 2) {     /* 调值确认 -> 回浏览 */
+  } else if (menuActive == 2) {     /* K3 确定: 生效 + 存 NVS -> 回主菜单 */
+    menuApply();
     menuActive = 1;
     drawMenu();
   } else if (menuActive == 3) {     /* 选更新源 -> 执行 */
@@ -2165,7 +2349,7 @@ void menuTick() {
     if (digitalRead(BTN_K1) == LOW) {
       menuLastMs = millis();
       if (menuActive == 1)      { menuCursor = (menuCursor + MENU_ITEMS - 1) % MENU_ITEMS; drawMenu(); }
-      else if (menuActive == 2) { menuAdjust(-1); drawMenu(); }
+      else if (menuActive == 2) { menuMove(-1); drawMenu(); }
       else if (menuActive == 3) { menuSub = 0; drawMenu(); }
     }
   }
@@ -2178,7 +2362,7 @@ void menuTick() {
     if (digitalRead(BTN_BRIGHT) == LOW) {
       menuLastMs = millis();
       if (menuActive == 1)      { menuCursor = (menuCursor + 1) % MENU_ITEMS; drawMenu(); }
-      else if (menuActive == 2) { menuAdjust(1); drawMenu(); }
+      else if (menuActive == 2) { menuMove(1); drawMenu(); }
       else if (menuActive == 3) { menuSub = 1; drawMenu(); }
     }
   }
@@ -2484,27 +2668,7 @@ void loop() {
         Serial.println(">>> key diag exit");
       }
     }
-    /* v53: 菜单外 K1/K2 也有反馈 —— K1 亮一档, K2 暗一档 (和菜单里一致: K1=减/K2=加) */
-    else if (digitalRead(BTN_K1) == LOW) {
-      delay(25);
-      if (digitalRead(BTN_K1) == LOW) {
-        g_bright = (g_bright + 1) % 3;   /* 变暗一档 */
-        applyBrightness();
-        saveSettings();
-        Serial.printf(">>> K1 bright=%d\n", g_bright);
-        delay(250);
-      }
-    }
-    else if (digitalRead(BTN_BRIGHT) == LOW) {
-      delay(25);
-      if (digitalRead(BTN_BRIGHT) == LOW) {
-        g_bright = (g_bright + 2) % 3;   /* 变亮一档 */
-        applyBrightness();
-        saveSettings();
-        Serial.printf(">>> K2 bright=%d\n", g_bright);
-        delay(250);
-      }
-    }
+        /* v54: 菜单外 K1/K2 无反应 (她定的: 改亮度/音量/走马灯一律进 K3 菜单) */
     otaServer.handleClient();        /* v39: OTA 监听 */
     /* v42: 每 10 分钟查一次余额; 每分钟同步夜间亮度/走马灯。
        v50: 菜单开着时不刷新, 免得把菜单画面冲掉。 */
