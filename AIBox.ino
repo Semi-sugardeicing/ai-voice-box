@@ -1,6 +1,15 @@
 /*
   ========================================
-   版本: v50 (密钥进盒子存储 + K3菜单 + 音量/走马灯进菜单)
+   版本: v52 (OTA推送也有底部进度条 + 设密钥立刻显示余额)
+   日期: 2026-11-22
+   改动一: 电脑 curl 推送固件时, 屏幕除了 KB 数再加底部进度条+百分比
+           (总大小取 HTTP 请求 Content-Length 估算)。
+   改动二: 网页 /config 保存密钥后立刻刷新余额上屏, 不用再等 10 分钟。
+   上一版: v51 (版本号常驻首页右下角)
+   日期: 2026-11-22
+   改动: 首页右下角永远显示 v+版本号(以前没密钥时被 NO KEY 占用),
+        没密钥时改为大字下方两行提醒: NO KEY + 配置页地址。
+   上一版: v50 (密钥进盒子存储 + K3菜单 + 音量/走马灯进菜单)
    日期: 2026-11-22
    改动一: DeepSeek 密钥不再写在固件里! 改成存在盒子自己的存储(NVS)里,
            浏览器开 http://盒子IP:8080/config 输入一次, 以后刷任何版本固件
@@ -78,7 +87,7 @@
 */
 
 /* 固件版本号 —— 必须在最前面, 首页/版本接口/更新逻辑都要用 */
-#define FW_VER       50
+#define FW_VER       52
 
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -1240,27 +1249,31 @@ void showIdle() {
   display.setCursor(96, 36);
   display.print("CNY");
 
-  /* 今日花费 */
-  display.setCursor(0, 44);
-  display.print("TODAY ");
-  display.print(todayCost, 4);
-  display.print(" CNY");
-
-  /* 上下文轮数提醒 (小字, 底部左) */
-  display.setCursor(0, 56);
-  display.print("CTX ");
-  display.print(ctxTokens);
-  display.print("/4K  T");
-  display.print(todayTurns);
-
-  /* v49: 右下角小字版本号; v50: 没密钥时改提醒设密钥 */
-  display.setCursor(86, 56);
   if (g_key.length() >= 20) {
-    display.print("v");
-    display.print(FW_VER);
+    /* 今日花费 */
+    display.setCursor(0, 44);
+    display.print("TODAY ");
+    display.print(todayCost, 4);
+    display.print(" CNY");
+    /* 上下文轮数提醒 (小字, 底部左) */
+    display.setCursor(0, 56);
+    display.print("CTX ");
+    display.print(ctxTokens);
+    display.print("/4K  T");
+    display.print(todayTurns);
   } else {
+    /* v51: 没密钥时大字下方提醒去哪设 (版本号挪到角落常驻) */
+    display.setCursor(0, 44);
     display.print("NO KEY");
+    display.setCursor(0, 56);
+    display.print(WiFi.localIP().toString());
+    display.print(":8080");
   }
+
+  /* 右下角常驻小字版本号, 不管有没有密钥都显示 */
+  display.setCursor(106, 56);
+  display.print("v");
+  display.print(FW_VER);
 
   updatePeriodLed();                  /* 高峰红 / 低谷绿 / 夜里灭 */
   display.display();
@@ -1330,11 +1343,14 @@ bool otaAuthorized() {
 }
 
 
+long g_otaTotal = 0;   /* v52: OTA 推送的总字节(取请求 Content-Length 估算), 0=未知 */
+
 void handleOtaFile() {
   HTTPUpload& up = otaServer.upload();
   if (up.status == UPLOAD_FILE_START) {
     if (!otaAuthorized()) return;      /* v45: 没口令别想刷 */
     Serial.printf(">>> OTA start: %s\n", up.filename.c_str());
+    g_otaTotal = otaServer.header("Content-Length").toInt();
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); }
     if (screenOK) {
       display.clearDisplay();
@@ -1351,8 +1367,19 @@ void handleOtaFile() {
         display.clearDisplay();
         display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
         display.setCursor(0, 10); display.print("OTA UPDATE");
-        display.setTextSize(2); display.setCursor(0, 26);
+        display.setTextSize(2); display.setCursor(0, 24);
         display.print(Update.progress() / 1024); display.print("K");
+
+        /* v52: 底部进度条 + 百分比 (总大小取请求 Content-Length 估算) */
+        long tot = g_otaTotal > 1000 ? g_otaTotal - 300 : 964L * 1024;
+        int pw = (int)(120L * Update.progress() / tot);
+        if (pw > 120) pw = 120;
+        display.drawRect(0, 44, 124, 10, SSD1306_WHITE);
+        if (pw > 0) display.fillRect(2, 46, pw, 6, SSD1306_WHITE);
+        display.setTextSize(1);
+        display.setCursor(0, 57);
+        display.print(100L * Update.progress() / tot);
+        display.print("%");
         display.display();
       }
     }
@@ -1408,6 +1435,7 @@ void handleConfigSave() {
   g_key = k;
   Serial.println(">>> key saved via /config");
   otaServer.send(200, "text/plain", "OK, key saved.");
+  fetchBalance();     /* v52: 设完密钥立刻把余额刷上屏, 眼见为实 */
   showIdle();
 }
 
