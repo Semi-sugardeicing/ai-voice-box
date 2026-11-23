@@ -98,7 +98,7 @@
 */
 
 /* 固件版本号 —— 必须在最前面, 首页/版本接口/更新逻辑都要用 */
-#define FW_VER       56
+#define FW_VER       60
 
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -132,10 +132,9 @@ struct WiFiItem { const char* ssid; const char* pass; };
 /* v56: 只预置手机热点 (出门在外靠它自己更新)。
    家里 WiFi 故意不写进固件 —— 避免公开暴露家庭网络/大致位置。
    回家连不上会自动开 esp32-S3开发版 热点, 手机填一次就永久记住(NVS)。 */
-/* v56: 这里可以留空 —— 开机连不上会自己开热点 esp32-S3开发版,
-   手机连上去填 WiFi 名和密码(支持多个), 存在盒子里。 */
 WiFiItem WIFI_LIST[] = {
-  { "预置WiFi名", "预置密码" },
+  { "一加 Ace 3",  "123456ok" },     /* 手机热点 */
+  /* 在这下面加新的, 照着上面格式写: */
   /* { "新的WiFi名", "新的密码" }, */
 };
 
@@ -1358,7 +1357,53 @@ void showIdle() {
   display.display();
 }
 
+/* v60: SSID 改纯英文 (中文 SSID 有些手机搜不到/乱码);
+   密码必须 >= 8 位 —— v59 用的 "123456" 只有 6 位, WPA2 不接受,
+   WiFi.softAP() 会直接返回 false 把整次设置丢掉, 于是芯片保留自己
+   默认的开放热点 ESP_XXXXXX —— 这就是她看到 ESP_7260D4 没密码的原因。 */
+#define AP_SSID  "AIBox-Setup"
+#define AP_PASS  "12345678"
+
 /* ================== WiFi ================== */
+/* v59: 开机就开热点。ESP32-S3 可以同时做 AP 和 STA,
+   所以"一边开热点、一边找已知 WiFi"是可行的 —— 这正是她要的。
+   连上 WiFi 之后再把热点关掉, 省电也少一个干扰源。 */
+bool g_apOn = false;
+
+void startSoftAp() {
+  if (g_apOn) return;
+  WiFi.mode(WIFI_AP_STA);            /* 关键: 两个都要, 不能只 AP */
+  /* v60: 必须检查返回值。密码太短/名字太长都会让这里静默失败,
+     然后芯片保留自己默认的 ESP_XXXXXX 开放热点, 表面上像"配置没生效"。 */
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS);
+  if (!ok) {
+    Serial.println(">>> softAP FAILED with password, retry open");
+    ok = WiFi.softAP(AP_SSID);       /* 退化成开放热点, 至少名字是我们设的 */
+  }
+  g_apOn = ok;
+  Serial.printf(">>> softAP %s: ssid=%s pass=%dchars ip=%s\n",
+                ok ? "ON" : "FAIL", AP_SSID, (int)strlen(AP_PASS),
+                WiFi.softAPIP().toString().c_str());
+  if (screenOK) {
+    display.clearDisplay();
+    display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 8);  display.print("HOTSPOT:");
+    display.setCursor(0, 22); display.print(AP_SSID);
+    display.setCursor(0, 36); display.print("pass: ");
+    display.print(AP_PASS);
+    display.setCursor(0, 52); display.print(ok ? "192.168.4.1" : "AP FAILED!");
+    display.display();
+    delay(1200);                     /* 让她看清热点名和密码 */
+  }
+}
+
+void stopSoftAp() {
+  if (!g_apOn) return;
+  WiFi.softAPdisconnect(true);       /* 只断 AP, 不动 STA */
+  g_apOn = false;
+  Serial.println(">>> softAP OFF (wifi connected)");
+}
+
 bool connectWiFi() {
   /* v56: NVS 里的多个 WiFi 全部加进去 (配网 > 固件里写死的列表) */
   for (int i = 0; i < g_savedN; i++) {
@@ -1687,7 +1732,8 @@ void handleSaveRecover() {
 
 /* OTA 服务上的配置页入口 (已联网时用 :8080/config 访问) */
 void handleConfigPage() {
-  if (!otaAuthorized()) return;
+  /* v57: 配置页不再要口令 —— 同一局域网打开就能改 WiFi/密钥。
+     刷固件的 /update 仍然要口令, 那才是真正需要守的动作。 */
   otaServer.send(200, "text/html", buildConfigHtml());
 }
 
@@ -2099,8 +2145,8 @@ void showKeyDiag() {
    连不上任何已知 WiFi -> 盒子自己开热点 esp32-S3开发版 (密码 123456),
    手机连上去, 浏览器打开 http://192.168.4.1 , 填 WiFi 名/密码 -> 存 NVS -> 重启。
    这样换热点/换地方再也不用改代码、不用发新版本。 */
-#define AP_SSID  "esp32-S3开发版"
-#define AP_PASS  "123456"
+/* v59: 开机默认就开这个热点, 连上 WiFi 后自动关。开着热点也能同时找 WiFi。 */
+
 
 DNSServer dnsServer;
 
@@ -2440,11 +2486,90 @@ void drawRollbackConfirm() {
 }
 
 /* ================== setup ================== */
+
+/* ============ v58 前置声明 (Arduino 自动原型生成不全) ============ */
+void      drawItem(const char* txt, int x, int y, int w, bool sel);
+int       drawZhNew(const char* s, int x, int y, bool invert);
+void      drawZhNew16(int idx, int x, int y, bool invert);
+int       zhNewIndex(const uint8_t* p);
+void      drawSwitchBox(const char* ver, bool hasBackup);
+int       askSwitch(const char* ver, bool hasBackup);
+void      doSwitchSlot();
+
+/* ============ v58: 切换启动分区 ============
+   板子里有两个应用区(app0/app1), 各存一版。这个函数:
+     1. 读出"另一个区"里那版的版本号
+     2. 屏幕上显示 切换到 vXX  + OK / NO
+     3. 选 OK 才切, 切完重启 */
+void doSwitchSlot() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  const esp_partition_t* other   = esp_ota_get_next_update_partition(NULL);
+  Serial.printf(">>> running=%s  other=%s\n",
+                running ? running->label : "?", other ? other->label : "?");
+
+  char ver[16] = "";
+  bool hasBackup = false;
+  if (other) {
+    esp_app_desc_t desc;
+    if (esp_ota_get_partition_description(other, &desc) == ESP_OK) {
+      /* ESP-IDF 的 version 字段会把 4 个字节按十六进制倒着拼,
+         v54 会变成 "34000000" 这种, 这里还原成十进制 */
+      uint32_t vnum = 0;
+      for (int i = 0; i < 32 && desc.version[i]; i++) {
+        char c = desc.version[i];
+        int d = (c >= '0' && c <= '9') ? c - '0'
+              : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+              : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+        if (d < 0) { vnum = 0; break; }
+        /* 反序: 第一位是最高位 */
+        vnum = vnum * 16 + d;
+      }
+      if (vnum > 0 && vnum < 100000) snprintf(ver, sizeof(ver), "%u", (unsigned)vnum);
+      else snprintf(ver, sizeof(ver), "%s", desc.version);
+      hasBackup = true;
+      Serial.printf(">>> other slot holds v%s\n", ver);
+    } else {
+      Serial.println(">>> other slot: no valid app");
+    }
+  }
+
+  int r = askSwitch(ver, hasBackup);
+  if (r != 0) {                       /* 取消或者超时 */
+    Serial.println(">>> switch cancelled");
+    screen2("CANCELLED", "stay here");
+    delay(1200);
+    showIdle();
+    return;
+  }
+
+  if (screenOK) {
+    display.clearDisplay();
+    drawZhNew("正在重启", 0, 8, false);
+    display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 30); display.print("v"); display.print(ver);
+    display.setCursor(0, 46); display.print("switching slot...");
+    display.display();
+  }
+  delay(1200);
+  if (esp_ota_set_boot_partition(other) != ESP_OK) {
+    Serial.println(">>> set boot partition FAILED");
+    screen2("SWITCH FAILED", "stay here");
+    delay(1500);
+    showIdle();
+    return;
+  }
+  Serial.println(">>> switching, rebooting");
+  delay(300);
+  ESP.restart();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
   Serial.printf("=== AI Box v%d ===\n", FW_VER);
+
+  /* v57 正式版: 启动断点只保留一行版本号, 方便一眼确认固件跑没跑起来 */
 
   /* v56: 开机先看有没有按住键 —— 必须放在最前面,
      因为后面校准/自检要十几秒, 那时早松手了。
@@ -2454,8 +2579,18 @@ void setup() {
   pinMode(BTN_K1,     INPUT_PULLUP);
   pinMode(BTN_TALK,   INPUT_PULLUP);
   delay(80);
-  bool forceSetup    = (digitalRead(BTN_REPLAY) == LOW);
-  bool forceRollback = (digitalRead(BTN_K1) == LOW && digitalRead(BTN_TALK) == LOW);
+  /* v57: 开机按键窗口放宽到 1.5 秒 (以前 80ms, 手慢一点就按不上) */
+  unsigned long tk0 = millis();
+  bool k3boot = false, k1boot = false, k4boot = false;
+  while (millis() - tk0 < 1500) {
+    if (digitalRead(BTN_REPLAY) == LOW) k3boot = true;
+    if (digitalRead(BTN_K1)     == LOW) k1boot = true;
+    if (digitalRead(BTN_TALK)   == LOW) k4boot = true;
+    if (k3boot || (k1boot && k4boot)) break;   /* 已经够了, 不用等满 */
+    delay(20);
+  }
+  bool forceSetup    = k3boot;
+  bool forceRollback = (k1boot && k4boot);
   if (forceSetup)    Serial.println(">>> K3 held at boot: force config portal");
   if (forceRollback) Serial.println(">>> K1+K4 held at boot: force rollback");
 
@@ -2489,6 +2624,7 @@ void setup() {
   Wire.setClock(400000);
   screenOK = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   Serial.println(screenOK ? "screen OK" : "screen NOT FOUND");
+  Serial.flush();
 
   /* I2S */
   setupMicI2S();
@@ -2526,6 +2662,9 @@ void setup() {
   }
 
   /* WiFi */
+  /* v59: 开机先开热点, 再去连已知 WiFi (两者同时进行) */
+  startSoftAp();
+
   if (!connectWiFi()) {
     /* v56: 上次按 K4 跳过了配网 -> 这次不再开热点, 直接离线进主循环 */
     bool skipSetup = false;
@@ -2545,9 +2684,13 @@ void setup() {
   }
   screen2("WiFi OK", WiFi.localIP().toString().c_str());
   delay(600);
+  stopSoftAp();                       /* v59: 连上了就把热点关掉 */
 
   startOtaServer();                   /* v39: 启动无线升级服务 */
-  checkFirmwareUpdate();              /* v40: 查电脑上有没新固件, 有就自动升级 */
+  /* v59: 开机不再自动查 GitHub。
+     救砖版绝对不能"开机就去网上下载固件覆盖自己"——
+     万一网上那版是坏的, 板子会陷入 刷入→重启→卡死 的死循环, 而且每圈都在写 flash。
+     要更新改用: 菜单里的"检查更新", 或者以后接 K2 长按。 */
   fetchBalance();
   showIdle();
   Serial.println(">>> READY, speak now");
@@ -2847,6 +2990,171 @@ int zhMenuIndex(const uint8_t* p) {
       return ZH_MENU_MAP[i].idx;
   return -1;
 }
+
+/*__V58_NEW_BLOCK_START__*/
+static const uint16_t ZH_NEW_FONT[][16] = {
+  { 0x1000, 0x11FC, 0x1064, 0x1244, 0x1E44, 0xF044, 0x5044, 0x1044, 0x1044, 0x16C4, 0x1C84, 0x1184, 0x0304, 0x061C, 0x1C18, 0x0000 }, /* 切 */
+  { 0x1080, 0x1080, 0x11F0, 0x1320, 0x7E60, 0x17F8, 0x1248, 0x1A48, 0xF248, 0x17FE, 0x10E0, 0x10A0, 0x1110, 0x160E, 0x7C00, 0x0000 }, /* 换 */
+  { 0x0002, 0x7F82, 0x1002, 0x3232, 0x2232, 0x7F32, 0x0932, 0x0832, 0x5D32, 0x1832, 0x0832, 0x0882, 0x1E02, 0xE006, 0x000C, 0x0000 }, /* 到 */
+  { 0x0040, 0x7E40, 0x10F8, 0x1098, 0x3198, 0x21B6, 0x7D92, 0x75FE, 0x7592, 0xF5B2, 0x3592, 0x3592, 0x3D12, 0x3712, 0x0214, 0x0000 }, /* 确 */
+  { 0x0300, 0x0180, 0x7FFC, 0x4004, 0x4004, 0x3FFC, 0x0180, 0x0180, 0x1980, 0x19F8, 0x1980, 0x3980, 0x2580, 0x6380, 0xC0FE, 0x0000 }, /* 定 */
+  { 0x7F80, 0x6600, 0x26FC, 0x2644, 0x3E4C, 0x2648, 0x2648, 0x3E48, 0x2630, 0x2630, 0x2730, 0xF678, 0x06CC, 0x0786, 0x0602, 0x0000 }, /* 取 */
+  { 0x0000, 0x2020, 0x3126, 0x19A4, 0x00A8, 0xC1FE, 0x6102, 0x0902, 0x09FE, 0x1102, 0x1102, 0x11FE, 0x2102, 0x2102, 0x6106, 0x410C }, /* 消 */
+  { 0x00F0, 0x2198, 0x1118, 0x0118, 0xC10E, 0x6300, 0x17F8, 0x1108, 0x1098, 0x2090, 0x2060, 0x2060, 0x60F0, 0x470E, 0x4C02, 0x0000 }, /* 没 */
+  { 0x0100, 0x0300, 0x7FFE, 0x0600, 0x0400, 0x0FF8, 0x1C18, 0x3FF8, 0x6C18, 0x4C18, 0x0FF8, 0x0C18, 0x0C18, 0x0C18, 0x0430, 0x0000 }, /* 有 */
+  { 0x0400, 0x0600, 0x0FE0, 0x1C40, 0x33C0, 0x6380, 0x06E0, 0x3C38, 0x7FFE, 0x1910, 0x1FF0, 0x19B0, 0x1910, 0x1FF0, 0x1810, 0x0000 }, /* 备 */
+  { 0x0800, 0x0890, 0x0890, 0x1998, 0x1108, 0x3308, 0x7604, 0xDFFE, 0x1048, 0x10C8, 0x1088, 0x1088, 0x1188, 0x1708, 0x1638, 0x0000 }, /* 份 */
+  { 0x0000, 0x0000, 0x7FFE, 0x0180, 0x0180, 0x0180, 0x1180, 0x11F8, 0x11F8, 0x1180, 0x1180, 0x1180, 0x1180, 0x1180, 0xFFFE, 0x0000 }, /* 正 */
+  { 0x0100, 0x0300, 0x0300, 0x7FFE, 0x0400, 0x0460, 0x0860, 0x1860, 0x3BFC, 0x6820, 0x4820, 0x0820, 0x0860, 0x0BFE, 0x0800, 0x0000 }, /* 在 */
+  { 0x0000, 0x3FF8, 0x3180, 0x0180, 0x7FFE, 0x0180, 0x3188, 0x1188, 0x1FF8, 0x1188, 0x1FF8, 0x0100, 0x3FFC, 0x0100, 0xFFFE, 0x0000 }, /* 重 */
+  { 0x0000, 0x0180, 0x1FFC, 0x1804, 0x1004, 0x1004, 0x1FFC, 0x1000, 0x1000, 0x13FC, 0x1206, 0x1206, 0x1206, 0x3206, 0x63FE, 0x4204 }, /* 启 */
+  { 0x0000, 0x0C20, 0x7FFE, 0x0C20, 0x0020, 0x3FF8, 0x0208, 0x3388, 0x18B0, 0x0980, 0x7FFE, 0x03C0, 0x07A0, 0x1D98, 0x718E, 0x4180 }, /* 菜 */
+  { 0x0000, 0x0820, 0x0C20, 0x0660, 0x1FF8, 0x1108, 0x1188, 0x1FF8, 0x1108, 0x1FF8, 0x1108, 0x0180, 0x7FFE, 0x0100, 0x0100, 0x0100 }, /* 单 */
+  { 0x2010, 0x2010, 0x23BC, 0x3916, 0x417E, 0x7B14, 0xF390, 0xB090, 0x7EBE, 0x3390, 0x3390, 0x3910, 0x3390, 0x36D0, 0x043C, 0x0000 }, /* 键 */
+  { 0x0804, 0x68FC, 0x6880, 0x6880, 0x7E80, 0x60EC, 0x60EC, 0x60A8, 0x7CA8, 0x6DB8, 0x6D90, 0x6D38, 0x4D6C, 0x4FC6, 0x0782, 0x0000 }, /* 版 */
+  { 0x0000, 0x0180, 0x0180, 0x0100, 0x7FFE, 0x03C0, 0x03C0, 0x0560, 0x0D30, 0x1918, 0x310C, 0x6FF6, 0x4180, 0x0100, 0x0180, 0x0180 }, /* 本 */
+  { 0x0000, 0x7FFC, 0x6004, 0x6004, 0x67E4, 0x6424, 0x6424, 0x6424, 0x6424, 0x67E4, 0x6004, 0x6004, 0x7FFC, 0x6004, 0x6004, 0x0000 }, /* 回 */
+  { 0x0000, 0x63F8, 0x3208, 0x0318, 0x0308, 0x7208, 0x13F8, 0x1204, 0x13D8, 0x1270, 0x1330, 0x13D8, 0x1384, 0x3C00, 0x47FE, 0x0000 }, /* 退 */
+  { 0x0830, 0x0C20, 0x0460, 0xFFFE, 0x0000, 0x3E0C, 0x226C, 0x3E4C, 0x324C, 0x224C, 0x3E4C, 0x226C, 0x220C, 0x220C, 0x2618, 0x0000 }, /* 前 */
+  { 0x2098, 0x3098, 0x1098, 0x03FE, 0x0098, 0x0098, 0xF198, 0x17FE, 0x1098, 0x1198, 0x1118, 0x1718, 0x3410, 0x4F00, 0x03FE, 0x0000 }, /* 进 */
+  { 0x003C, 0x1C06, 0x1406, 0x7F06, 0x5506, 0x553E, 0x5560, 0x7760, 0x6360, 0x6160, 0x7F60, 0x4161, 0x4163, 0x7F62, 0x413E, 0x0000 }, /* 配 */
+  { 0x0000, 0x7FFC, 0x6004, 0x7B94, 0x6AD4, 0x6E74, 0x6664, 0x6664, 0x6E74, 0x7BD4, 0x7194, 0x6104, 0x6004, 0x6004, 0x601C, 0x0000 }, /* 网 */
+  { 0x0000, 0x2030, 0x31F8, 0x1118, 0x0118, 0x0118, 0xF30E, 0x37F8, 0x3198, 0x3098, 0x30D0, 0x3470, 0x3860, 0x31D8, 0x3F0E, 0x0C02 }, /* 设 */
+  { 0x3FFC, 0x2644, 0x3FFC, 0x0100, 0x7FFE, 0x0100, 0x1FF0, 0x1810, 0x1FF0, 0x1810, 0x1FF0, 0x1810, 0x1810, 0x1818, 0x0000, 0x0000 }, /* 置 */
+};
+
+static const struct { uint8_t b[3]; uint8_t idx; } ZH_NEW_MAP[] = {
+  { {0xE5, 0x88, 0x87}, 0 }, /* 切 */
+  { {0xE6, 0x8D, 0xA2}, 1 }, /* 换 */
+  { {0xE5, 0x88, 0xB0}, 2 }, /* 到 */
+  { {0xE7, 0xA1, 0xAE}, 3 }, /* 确 */
+  { {0xE5, 0xAE, 0x9A}, 4 }, /* 定 */
+  { {0xE5, 0x8F, 0x96}, 5 }, /* 取 */
+  { {0xE6, 0xB6, 0x88}, 6 }, /* 消 */
+  { {0xE6, 0xB2, 0xA1}, 7 }, /* 没 */
+  { {0xE6, 0x9C, 0x89}, 8 }, /* 有 */
+  { {0xE5, 0xA4, 0x87}, 9 }, /* 备 */
+  { {0xE4, 0xBB, 0xBD}, 10 }, /* 份 */
+  { {0xE6, 0xAD, 0xA3}, 11 }, /* 正 */
+  { {0xE5, 0x9C, 0xA8}, 12 }, /* 在 */
+  { {0xE9, 0x87, 0x8D}, 13 }, /* 重 */
+  { {0xE5, 0x90, 0xAF}, 14 }, /* 启 */
+  { {0xE8, 0x8F, 0x9C}, 15 }, /* 菜 */
+  { {0xE5, 0x8D, 0x95}, 16 }, /* 单 */
+  { {0xE9, 0x94, 0xAE}, 17 }, /* 键 */
+  { {0xE7, 0x89, 0x88}, 18 }, /* 版 */
+  { {0xE6, 0x9C, 0xAC}, 19 }, /* 本 */
+  { {0xE5, 0x9B, 0x9E}, 20 }, /* 回 */
+  { {0xE9, 0x80, 0x80}, 21 }, /* 退 */
+  { {0xE5, 0x89, 0x8D}, 22 }, /* 前 */
+  { {0xE8, 0xBF, 0x9B}, 23 }, /* 进 */
+  { {0xE9, 0x85, 0x8D}, 24 }, /* 配 */
+  { {0xE7, 0xBD, 0x91}, 25 }, /* 网 */
+  { {0xE8, 0xAE, 0xBE}, 26 }, /* 设 */
+  { {0xE7, 0xBD, 0xAE}, 27 }, /* 置 */
+};
+#define ZH_NEW_N 28
+
+/* 查 v58 新字库里的字形, 返回下标, 没有就 -1 */
+int zhNewIndex(const uint8_t* p) {
+  for (int i = 0; i < ZH_NEW_N; i++)
+    if (p[0] == ZH_NEW_MAP[i].b[0] && p[1] == ZH_NEW_MAP[i].b[1] && p[2] == ZH_NEW_MAP[i].b[2])
+      return ZH_NEW_MAP[i].idx;
+  return -1;
+}
+
+/* 画 v58 新字库里的一个汉字 */
+void drawZhNew16(int idx, int x, int y, bool invert) {
+  if (idx < 0) return;
+  for (int r = 0; r < 16; r++) {
+    uint16_t row = ZH_NEW_FONT[idx][r];
+    for (int c = 0; c < 16; c++) {
+      bool on = (row >> (15 - c)) & 1;
+      display.drawPixel(x + c, y + r, (on != invert) ? SSD1306_WHITE : SSD1306_BLACK);
+    }
+  }
+}
+
+/* 混排绘制: 汉字用 v58 新字库(16px), 其余 ASCII 用内置 6px 小字。
+   返回结束 x。 */
+int drawZhNew(const char* s, int x, int y, bool invert) {
+  int cx = x;
+  for (const char* p = s; *p; ) {
+    if ((uint8_t)*p >= 0xE0) {
+      drawZhNew16(zhNewIndex((const uint8_t*)p), cx, y, invert);
+      cx += 16; p += 3;
+    } else {
+      display.setTextSize(1);
+      display.setTextColor(invert ? SSD1306_BLACK : SSD1306_WHITE);
+      display.setCursor(cx, y + 4);
+      display.print(*p);
+      cx += 6; p++;
+    }
+  }
+  return cx;
+}
+
+void drawItem(const char* txt, int x, int y, int w, bool sel);
+
+/* ============ v58 版本切换确认框 ============
+   target = 另一个分区, ver = 那版的版本号字符串
+   返回 true = 用户选了确定 */
+static int  g_okSel = 0;          /* 0 = 确定, 1 = 取消 */
+
+void drawSwitchBox(const char* ver, bool hasBackup) {
+  if (!screenOK) return;
+  display.clearDisplay();
+  if (!hasBackup) {
+    drawZhNew("没有备份", 0, 8, false);
+    display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 30); display.print("no firmware in other slot");
+    display.setCursor(0, 44); display.print("K3 = back");
+    display.display();
+    return;
+  }
+  drawZhNew("切换到", 0, 4, false);
+  drawZhNew("v", 52, 4, false);
+  display.setTextSize(2); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(60, 2); display.print(ver);
+  /* 两个选项 */
+  drawItem("OK",   10, 34, 52,  (g_okSel == 0));
+  drawItem("NO",   72, 34, 52,  (g_okSel == 1));
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 54); display.print("K1/K2 sel  K3 ok");
+  display.display();
+}
+
+/* 弹框等用户按键: 返回 0=确定 1=取消 -1=超时 */
+int askSwitch(const char* ver, bool hasBackup) {
+  if (!hasBackup) {
+    drawSwitchBox(ver, false);
+    unsigned long t0 = millis();
+    while (millis() - t0 < 4000) {
+      if (digitalRead(BTN_REPLAY) == LOW) break;
+      delay(20);
+    }
+    return 1;
+  }
+  g_okSel = 0;
+  drawSwitchBox(ver, true);
+  unsigned long t0 = millis();
+  while (millis() - t0 < 12000) {
+    if (digitalRead(BTN_K1) == LOW) {
+      g_okSel = 0; drawSwitchBox(ver, true);
+      while (digitalRead(BTN_K1) == LOW) delay(20);
+    } else if (digitalRead(BTN_BRIGHT) == LOW) {
+      g_okSel = 1; drawSwitchBox(ver, true);
+      while (digitalRead(BTN_BRIGHT) == LOW) delay(20);
+    } else if (digitalRead(BTN_REPLAY) == LOW) {
+      while (digitalRead(BTN_REPLAY) == LOW) delay(20);
+      return g_okSel;
+    }
+    delay(20);
+  }
+  return -1;                       /* 超时 = 不动 */
+}
+
+
 
 /* 画一个 16x16 汉字; fg/bg 决定正色还是反色 */
 void drawZh16(int idx, int x, int y, bool invert) {
@@ -3366,6 +3674,53 @@ void loop() {
      K1 ∧   = 菜单里: 上移 / 调值时减小
      K2 ∨   = 菜单里: 下移 / 调值时增大   */
   while (true) {
+    /* ===== v57: 全局长按 (任何界面都有效) =====
+         K3(#)  长按 3 秒 -> 开热点进配网 (连按也算, 累积够 3 秒即触发)
+         K1(^)  长按 3 秒 -> 重装最近的备份固件 (另一个分区, 不带联网)
+         K2(v)  长按 3 秒 -> 刷最新正式版 (先问 GitHub 最新版本号再刷)
+       三个键都只在菜单外生效, 免得和菜单操作打架。 */
+    if (!menuActive) {
+      static unsigned long t3 = 0, t1 = 0, t2 = 0;
+      static bool d3 = false, d1 = false, d2 = false;
+      bool k3 = (digitalRead(BTN_REPLAY) == LOW);
+      bool k1 = (digitalRead(BTN_K1)     == LOW);
+      bool k2 = (digitalRead(BTN_BRIGHT) == LOW);
+      unsigned long now = millis();
+
+      /* ---- K3: 配网 ---- */
+      if (k3) {
+        if (!d3) { d3 = true; t3 = now; }
+        else if (now - t3 >= 3000) {
+          Serial.println(">>> K3 held 3s -> config portal");
+          if (screenOK) {
+            display.clearDisplay();
+            drawZhNew("配网", 0, 6, false);
+            display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+            display.setCursor(44, 10); display.print("starting...");
+            display.setCursor(0, 32); display.print("release K3");
+            display.display();
+          }
+          delay(500);
+          while (digitalRead(BTN_REPLAY) == LOW) delay(20);
+          runConfigPortal();                 /* 不返回 */
+        }
+      } else d3 = false;
+
+      /* ---- K1 / K2: 两个分区互切 (不联网) ----
+         K1 = 切到另一个分区(屏幕显示那版版本号, 确认后切)
+         K2 = 和 K1 是同一个动作 —— 因为分区只有两个, 来回按就是来回切。
+              之所以两个键都做, 是她要求的: 后退/前进都能按。 */
+      if ((k1 && !k2) || (k2 && !k1)) {
+        bool isK1 = (k1 && !k2);
+        if (!d1 && !d2) { d1 = true; d2 = true; t1 = now; t2 = now; }
+        else if (now - (isK1 ? t1 : t2) >= 5000) {
+          Serial.printf(">>> %s held 5s -> switch slot\n", isK1 ? "K1" : "K2");
+          while (digitalRead(BTN_K1) == LOW || digitalRead(BTN_BRIGHT) == LOW) delay(20);
+          doSwitchSlot();
+        }
+      } else { d1 = false; d2 = false; }
+    }
+
     if (menuActive) {
       menuTick();
     }
@@ -3393,24 +3748,25 @@ void loop() {
       delay(25);
       if (digitalRead(BTN_REPLAY) == LOW) {
         if (g_bright == 0) { g_bright = 2; applyBrightness(); }  /* 熄屏先点亮 */
-        /* v56: 按住 K3 满 3 秒 = 强制进配网模式(不管当前 WiFi 是否正常) */
-        unsigned long t3 = millis();
-        bool  forced = false;
+        /* v57: 长按判断已挪到 loop 顶部全局处理, 这里只管短按进菜单。
+           短按 = 松开时还没到 1.5 秒 */
+        unsigned long tk = millis();
+        bool heldLong = false;
         while (digitalRead(BTN_REPLAY) == LOW) {
-          if (millis() - t3 > 3000) { forced = true; break; }
+          if (millis() - tk > 1500) { heldLong = true; break; }
           delay(20);
         }
-        if (forced) {
-          Serial.println(">>> force config portal (K3 held 3s)");
-          while (digitalRead(BTN_REPLAY) == LOW) delay(20);   /* 等松手 */
-          runConfigPortal();                                  /* 不返回, 填好自动重启 */
+        if (heldLong) {                 /* 按压中, 交给顶部的全局计时 */
+          delay(50);
+        } else
+        {
+          menuActive = 1;
+          menuCursor = 0;
+          menuLastMs = millis();
+          drawMenu();
+          Serial.println(">>> menu open");
+          delay(300);
         }
-        menuActive = 1;
-        menuCursor = 0;
-        menuLastMs = millis();
-        drawMenu();
-        Serial.println(">>> menu open");
-        delay(300);
       }
     }
     /* v53: K1+K2 同时按 1 秒 = 按键自检屏 */
@@ -3427,7 +3783,9 @@ void loop() {
         Serial.println(">>> key diag exit");
       }
     }
-        /* v54: 菜单外 K1/K2 无反应 (她定的: 改亮度/音量/走马灯一律进 K3 菜单) */
+        /* v54: 菜单外 K1/K2 无反应 (她定的: 改亮度/音量/走马灯一律进 K3 菜单)
+           v58: 这两个键现在是"长按 5 秒切换版本", 短按不再弹提示, 免得她以为坏了
+                 (长按的反馈在屏幕上给足 12 秒) */
     otaServer.handleClient();        /* v39: OTA 监听 */
     /* v42: 每 10 分钟查一次余额; 每分钟同步夜间亮度/走马灯。
        v50: 菜单开着时不刷新, 免得把菜单画面冲掉。 */
