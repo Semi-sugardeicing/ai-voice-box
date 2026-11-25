@@ -312,11 +312,12 @@ void drawScreen() {
   if (cfgMode) {
     display.setCursor(14, 0); display.print("SETUP MODE");
   } else if (wifiReady) {
-    drawWifiBar(WiFi.RSSI());
-    display.setCursor(78, 0);
-    display.printf("%d/%d", curSt + 1, ST_NUM);
-    display.setCursor(106, 0);
-    display.printf("VOL%d", vol);
+    drawWifiBar(WiFi.RSSI());           /* x=2..13 */
+    display.setCursor(20, 0);
+    display.printf("%d/%d", curSt + 1, ST_NUM);   /* 台号 20..~48 */
+    display.setCursor(56, 0);
+    display.printf("V%d", vol);                    /* 音量 56..~70 */
+    /* 电量占位/时间留白 */
   } else {
     display.setCursor(14, 0); display.print("NO WIFI");
   }
@@ -348,14 +349,13 @@ void drawScreen() {
   display.setCursor(0, 44);
   display.print(stLine2.c_str());
 
-  /* 底部：音量条（0..21 换算成百分比） */
+  /* 音量条：放在状态文字下方、屏幕底部线之上 */
   {
     int pct = (int)((uint32_t)vol * 100 / VOL_MAX);
     if (pct > 100) pct = 100;
-    display.drawRect(0, 54, SCR_W, 8, SSD1306_WHITE);
-    /* 刻度：每 4 格一个分隔，方便目测 */
-    for (int k = 1; k < 5; k++) display.drawPixel(k * SCR_W / 5, 56, SSD1306_WHITE);
-    if (pct > 0) display.fillRect(1, 55, (SCR_W - 2) * pct / 100, 6, SSD1306_WHITE);
+    display.drawRect(0, 54, SCR_W, 9, SSD1306_WHITE);
+    for (int k = 1; k < 5; k++) display.drawPixel(k * SCR_W / 5, 57, SSD1306_WHITE);
+    if (pct > 0) display.fillRect(1, 55, (SCR_W - 2) * pct / 100, 7, SSD1306_WHITE);
   }
 
   display.display();
