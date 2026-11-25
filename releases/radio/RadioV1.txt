@@ -61,6 +61,35 @@ void drawScreen();
 void startStation(int idx);
 void toggleMute();
 void audio_showstreamtitle(const char* info);
+
+/* ==================== 按键 ==================== */
+struct KeyBtn { uint8_t pin; bool stable; bool lastRead; unsigned long tMs; bool fired; };
+KeyBtn bPrev = { BTN_PREV, HIGH, HIGH, 0, false };
+KeyBtn bNext = { BTN_NEXT, HIGH, HIGH, 0, false };
+KeyBtn bOk   = { BTN_OK,   HIGH, HIGH, 0, false };
+KeyBtn bStop = { BTN_STOP, HIGH, HIGH, 0, false };
+
+/* 返回 true = 刚按下那一下（只在松开后重新计数） */
+bool keyPressed(KeyBtn& kb) {
+  bool rd = digitalRead(kb.pin);
+  unsigned long now = millis();
+  if (rd != kb.lastRead) { kb.lastRead = rd; kb.tMs = now; }
+  if (now - kb.tMs < 25) return false;            /* 25ms 消抖 */
+  if (rd != kb.stable) {
+    kb.stable = rd;
+    if (rd == LOW && !kb.fired) { kb.fired = true; return true; }
+    if (rd == HIGH) kb.fired = false;
+  }
+  return false;
+}
+
+void handleKeys() {
+  if (keyPressed(bPrev)) { Serial.println("[K1] prev"); startStation(curSt - 1); }
+  if (keyPressed(bNext)) { Serial.println("[K2] next"); startStation(curSt + 1); }
+  if (keyPressed(bOk))   { Serial.println("[K3] ok/retry"); startStation(curSt); }
+  if (keyPressed(bStop)) { toggleMute(); }
+}
+
 void audio_eof_stream(const char* info);
 
 /* ---------------- WiFi ----------------
@@ -310,34 +339,6 @@ void connectWifi() {
   }
   Serial.println("[WIFI] FAILED -> config portal");
   runCfgPortal();     /* 不返回 */
-}
-
-/* ==================== 按键 ==================== */
-struct KeyBtn { uint8_t pin; bool stable; bool lastRead; unsigned long tMs; bool fired; };
-KeyBtn bPrev = { BTN_PREV, HIGH, HIGH, 0, false };
-KeyBtn bNext = { BTN_NEXT, HIGH, HIGH, 0, false };
-KeyBtn bOk   = { BTN_OK,   HIGH, HIGH, 0, false };
-KeyBtn bStop = { BTN_STOP, HIGH, HIGH, 0, false };
-
-/* 返回 true = 刚按下那一下（只在松开后重新计数） */
-bool keyPressed(KeyBtn& kb) {
-  bool rd = digitalRead(kb.pin);
-  unsigned long now = millis();
-  if (rd != kb.lastRead) { kb.lastRead = rd; kb.tMs = now; }
-  if (now - kb.tMs < 25) return false;            /* 25ms 消抖 */
-  if (rd != kb.stable) {
-    kb.stable = rd;
-    if (rd == LOW && !kb.fired) { kb.fired = true; return true; }
-    if (rd == HIGH) kb.fired = false;
-  }
-  return false;
-}
-
-void handleKeys() {
-  if (keyPressed(bPrev)) { Serial.println("[K1] prev"); startStation(curSt - 1); }
-  if (keyPressed(bNext)) { Serial.println("[K2] next"); startStation(curSt + 1); }
-  if (keyPressed(bOk))   { Serial.println("[K3] ok/retry"); startStation(curSt); }
-  if (keyPressed(bStop)) { toggleMute(); }
 }
 
 /* ==================== 音频事件回调 ====================
