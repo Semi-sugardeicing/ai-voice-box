@@ -161,7 +161,7 @@ void drawScreen() {
   display.print(stLine2.c_str());
 
   /* 缓冲条：input buffer 填充率，能看出它还在不在收数据 */
-  uint32_t tot = IN_BUF_TOTAL;
+  const uint32_t tot = IN_BUF_TOTAL;
   uint32_t fil = audio.inBufferFilled();
   int pct = (tot > 0) ? (int)((uint64_t)fil * 100 / tot) : 0;
   if (pct > 100) pct = 100;
@@ -298,7 +298,7 @@ void connectWifi() {
     display.display();
   }
 
-  wl_status_t st = wifiMulti.run(15000);
+  wl_status_t st = (wl_status_t)wifiMulti.run(15000);
   if (st == WL_CONNECTED) {
     wifiReady = true;
     char ipbuf[20];
@@ -313,31 +313,31 @@ void connectWifi() {
 }
 
 /* ==================== 按键 ==================== */
-struct Btn { uint8_t pin; bool stable; bool lastRead; unsigned long tMs; bool fired; };
-Btn bPrev = { BTN_PREV, HIGH, HIGH, 0, false };
-Btn bNext = { BTN_NEXT, HIGH, HIGH, 0, false };
-Btn bOk   = { BTN_OK,   HIGH, HIGH, 0, false };
-Btn bStop = { BTN_STOP, HIGH, HIGH, 0, false };
+struct KeyBtn { uint8_t pin; bool stable; bool lastRead; unsigned long tMs; bool fired; };
+KeyBtn bPrev = { BTN_PREV, HIGH, HIGH, 0, false };
+KeyBtn bNext = { BTN_NEXT, HIGH, HIGH, 0, false };
+KeyBtn bOk   = { BTN_OK,   HIGH, HIGH, 0, false };
+KeyBtn bStop = { BTN_STOP, HIGH, HIGH, 0, false };
 
 /* 返回 true = 刚按下那一下（只在松开后重新计数） */
-bool justPressed(Btn& b) {
-  bool rd = digitalRead(b.pin);
+bool keyPressed(KeyBtn& kb) {
+  bool rd = digitalRead(kb.pin);
   unsigned long now = millis();
-  if (rd != b.lastRead) { b.lastRead = rd; b.tMs = now; }
-  if (now - b.tMs < 25) return false;            /* 25ms 消抖 */
-  if (rd != b.stable) {
-    b.stable = rd;
-    if (rd == LOW && !b.fired) { b.fired = true; return true; }
-    if (rd == HIGH) b.fired = false;
+  if (rd != kb.lastRead) { kb.lastRead = rd; kb.tMs = now; }
+  if (now - kb.tMs < 25) return false;            /* 25ms 消抖 */
+  if (rd != kb.stable) {
+    kb.stable = rd;
+    if (rd == LOW && !kb.fired) { kb.fired = true; return true; }
+    if (rd == HIGH) kb.fired = false;
   }
   return false;
 }
 
 void handleKeys() {
-  if (justPressed(bPrev)) { Serial.println("[K1] prev"); startStation(curSt - 1); }
-  if (justPressed(bNext)) { Serial.println("[K2] next"); startStation(curSt + 1); }
-  if (justPressed(bOk))   { Serial.println("[K3] ok/retry"); startStation(curSt); }
-  if (justPressed(bStop)) { toggleMute(); }
+  if (keyPressed(bPrev)) { Serial.println("[K1] prev"); startStation(curSt - 1); }
+  if (keyPressed(bNext)) { Serial.println("[K2] next"); startStation(curSt + 1); }
+  if (keyPressed(bOk))   { Serial.println("[K3] ok/retry"); startStation(curSt); }
+  if (keyPressed(bStop)) { toggleMute(); }
 }
 
 /* ==================== 音频事件回调 ====================
@@ -414,7 +414,7 @@ void loop() {
   /* ---- 断流自恢复：缓冲 12 秒没变化，判定卡死 -> 重连 ---- */
   if (now - lastBufChg > 3000) {
     lastBufChg = now;
-    uint32_t tot = IN_BUF_TOTAL;
+    const uint32_t tot = IN_BUF_TOTAL;
     uint32_t fil = audio.inBufferFilled();
     uint32_t pct = (tot > 0) ? (uint32_t)((uint64_t)fil * 100 / tot) : 0;
     if (pct != lastBufPct) {
