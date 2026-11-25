@@ -529,6 +529,29 @@ void saveAllNvs() {
   prefs.end();
 }
 
+
+/* ==================== 网页发送（踩过的坑，别再改） ====================
+   错误写法（浏览器报 ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_LENGTH）：
+     sendHeader("Content-Length", n); send(200,"text/html",""); sendContent(h);
+   —— ESP32 WebServer 的 send() 在 body 为空时自己还会补一个 Content-Length，
+      于是两个头，浏览器直接拒收。
+   正确写法：先 setContentLength()（它只设一次），再 send(200,type,NULL)，
+   最后按 512 字节一段推 + flush + delay(2)（一次性大包会卡住主循环被看门狗复位）。 */
+void sendPage(const String& html) {
+  cfgServer.setContentLength(html.length());
+  cfgServer.sendHeader("Cache-Control", "no-store");
+  cfgServer.send(200, "text/html", "");
+  const size_t CH = 512;
+  size_t total = html.length();
+  for (size_t i = 0; i < total; i += CH) {
+    size_t n = total - i;
+    if (n > CH) n = CH;
+    cfgServer.sendContent(html.substring(i, i + n));
+    cfgServer.client().flush();
+    delay(2);
+  }
+}
+
 /* ---- 网页 ---- */
 void htmlHead(String& h, const char* title) {
   h += F("<!doctype html><meta charset=utf-8>");
@@ -586,10 +609,7 @@ void buildCfgHtml() {
   h += F("<p class=hint>内置 20 个央广/地方台不变，自定义的追加在后面。</p>");
   h += F("<p><a href=/restart><button>重启盒子</button></a></p>");
 
-  cfgServer.sendHeader("Content-Type", "text/html; charset=utf-8");
-  cfgServer.sendHeader("Content-Length", String(h.length()));
-  cfgServer.send(200, "text/html", "");
-  cfgServer.sendContent(h);
+  sendPage(h);
 }
 
 void sendMsg(const char* msg) {
@@ -598,10 +618,7 @@ void sendMsg(const char* msg) {
   htmlHead(h, "OK");
   h += F("<p class=ok>"); h += msg; h += F("</p>");
   h += F("<p><a href=/><button>返回</button></a></p>");
-  cfgServer.sendHeader("Content-Type", "text/html; charset=utf-8");
-  cfgServer.sendHeader("Content-Length", String(h.length()));
-  cfgServer.send(200, "text/html", "");
-  cfgServer.sendContent(h);
+  sendPage(h);
 }
 
 void setupWeb() {
