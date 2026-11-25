@@ -99,6 +99,7 @@ String   stLine2     = "";              /* 屏幕第三行小字 */
 bool     wifiReady   = false;
 unsigned long lastDraw   = 0;
 unsigned long lastBufChk = 0;
+int chipTemp = 0;                 /* V5: 芯片温度 ℃ */
 unsigned long lastStChange = 0;   /* v2: 切台冷却 */
 #define SWITCH_COOLDOWN_MS 800
 uint32_t      lastBufPct = 0xFFFFFFFF;
@@ -119,7 +120,7 @@ Preferences prefs;
 WebServer cfgServer(80);
 DNSServer dnsServer;
 bool cfgMode = false;
-const char* AP_SSID = "Radio-Setup";
+const char* AP_SSID = "esp32-S3收音机";
 const char* AP_PASS = "12345678";
 
 /* ---------------- 前置声明 ---------------- */
@@ -128,6 +129,7 @@ void startStation(int idx);
 void volUp();
 void volDown();
 void handleKeys();
+int  readChipTemp();
 int  totalStations();
 void getStation(int idx, const char*& nm, const char*& url, String& nmBuf, String& urlBuf);
 void loadNvs();
@@ -335,6 +337,12 @@ int drawZhString(const char* s, int x, int y) {
   return cx - x;
 }
 
+/* ==================== 芯片温度 ==================== */
+/* S3 内置温度传感器，精度一般（±5℃），用来判断"烫不烫"够了 */
+int readChipTemp() {
+  return (int)(temperatureRead() + 0.5f);
+}
+
 /* ==================== 屏幕 ==================== */
 void drawWifiBar(int rssi) {
   if (!screenOK) return;
@@ -363,11 +371,12 @@ void drawScreen() {
     display.setCursor(14, 0); display.print("SETUP MODE");
   } else if (wifiReady) {
     drawWifiBar(WiFi.RSSI());           /* x=2..13 */
-    display.setCursor(20, 0);
-    display.printf("%2d/%d", curSt + 1, totalStations());   /* 台号 20..~48 */
-    display.setCursor(56, 0);
-    display.printf("V%d", vol);                    /* 音量 56..~70 */
-    /* 电量占位/时间留白 */
+    display.setCursor(18, 0);
+    display.printf("%2d/%d", curSt + 1, totalStations());   /* 台号 */
+    display.setCursor(52, 0);
+    display.printf("V%d", vol);                    /* 音量 */
+    display.setCursor(80, 0);
+    display.printf("%dC", chipTemp);               /* 芯片温度 */
   } else {
     display.setCursor(14, 0); display.print("NO WIFI");
   }
@@ -815,6 +824,7 @@ void loop() {
 
   if (now - lastDraw > 300) {
     lastDraw = now;
+    chipTemp = readChipTemp();     /* V5: 温度 */
     if (wifiReady && WiFi.status() != WL_CONNECTED) {
       wifiReady = false;
       Serial.println("[WIFI] lost");
