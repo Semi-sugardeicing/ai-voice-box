@@ -371,15 +371,17 @@ void drawScreen() {
   if (cfgMode) {
     display.setCursor(14, 0); display.print("SETUP MODE");
   } else if (wifiReady) {
-    drawWifiBar(WiFi.RSSI());                       /* x=2..13 */
-    display.setCursor(15, 0);
-    display.printf("%2d/%d", curSt + 1, totalStations());   /* 台号 15..43 */
-    display.setCursor(45, 0);
-    display.printf("E%d", vol);                     /* 音量 45..57 */
-    display.setCursor(60, 0);
-    display.printf("T%d", chipTemp);                /* 温度 60..78 */
-    display.setCursor(84, 0);
-    display.printf("v%d", FW_VER);                  /* 版本 84..128 */
+    /* V5 精确排版（128px，字号1 = 6px/字）
+       信号 0-13 | 台号 20-49 | 音量 55-72 | 温度 78-95 | 版本 100-127 */
+    drawWifiBar(WiFi.RSSI());
+    display.setCursor(20, 0);
+    display.printf("%2d/%d", curSt + 1, totalStations());
+    display.setCursor(55, 0);
+    display.printf("E%d", vol);
+    display.setCursor(78, 0);
+    display.printf("T%d", chipTemp);
+    display.setCursor(100, 0);
+    display.printf("v%d", FW_VER);
   } else {
     display.setCursor(14, 0); display.print("NO WIFI");
   }
