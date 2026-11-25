@@ -72,7 +72,9 @@ const int ST_NUM = sizeof(STATIONS) / sizeof(STATIONS[0]);
 int      curSt       = 0;
 bool     playing     = false;
 bool     mutedByUser = false;
-uint8_t  vol         = 7;               /* 0..21 */
+uint8_t  vol         = 10;              /* 0..21，K3 加 K4 减 */
+const uint8_t VOL_MAX = 21;
+const uint8_t VOL_STEP = 2;             /* 每按一次跳 2 格，快一点 */
 String   stLine1     = "";              /* 屏幕第二行小字 */
 String   stLine2     = "";              /* 屏幕第三行小字 */
 bool     wifiReady   = false;
@@ -102,7 +104,8 @@ const char* AP_PASS = "12345678";
 /* ---------------- 前置声明 ---------------- */
 void drawScreen();
 void startStation(int idx);
-void toggleMute();
+void volUp();
+void volDown();
 void handleKeys();
 
 /* ==================== 按键 ==================== */
@@ -125,11 +128,33 @@ bool keyPressed(KeyBtn& kb) {
   return false;
 }
 
+/* 音量加减：满档 21，减到 0 = 静音 */
+void volUp() {
+  uint8_t nv = vol + VOL_STEP;
+  if (nv > VOL_MAX) nv = VOL_MAX;
+  if (nv == vol) return;
+  vol = nv;
+  if (mutedByUser) mutedByUser = false;
+  audio.setVolume(vol);
+  Serial.printf("[VOL] %d\n", vol);
+  drawScreen();
+}
+
+void volDown() {
+  if (vol <= VOL_STEP) vol = 0;
+  else                 vol -= VOL_STEP;
+  if (vol == 0) mutedByUser = true;
+  else          mutedByUser = false;
+  audio.setVolume(vol);
+  Serial.printf("[VOL] %d\n", vol);
+  drawScreen();
+}
+
 void handleKeys() {
   if (keyPressed(bPrev)) { Serial.println("[K1] prev"); startStation(curSt - 1); }
   if (keyPressed(bNext)) { Serial.println("[K2] next"); startStation(curSt + 1); }
-  if (keyPressed(bOk))   { Serial.println("[K3] retry"); startStation(curSt); }
-  if (keyPressed(bStop)) { toggleMute(); }
+  if (keyPressed(bOk))   { Serial.println("[K3] vol+");  volUp();   }
+  if (keyPressed(bStop)) { Serial.println("[K4] vol-");  volDown(); }
 }
 
 
@@ -275,7 +300,8 @@ void drawScreen() {
 
   display.setTextSize(1);
   display.setCursor(0, 34);
-  if (mutedByUser)     display.print("|| PAUSED  K4=resume");
+  if (vol == 0)        display.print("|| MUTED   K3=vol+");
+  else if (!audio.isRunning() && playing) display.print("reconnecting...");
   else if (!wifiReady) display.print("connecting wifi...");
   else                 display.print(stLine1.c_str());
 
@@ -297,7 +323,6 @@ void startStation(int idx) {
   if (idx < 0)       idx = ST_NUM - 1;
   if (idx >= ST_NUM) idx = 0;
   curSt = idx;
-  mutedByUser = false;
 
   audio.stopSong();
   playing = false;
@@ -310,6 +335,7 @@ void startStation(int idx) {
   if (ok) {
     playing = true;
     audio.setVolume(vol);
+    mutedByUser = (vol == 0);
     stLine1 = "buffering...";
   } else {
     stLine1 = "CONNECT FAIL";
@@ -318,12 +344,6 @@ void startStation(int idx) {
   drawScreen();
 }
 
-void toggleMute() {
-  mutedByUser = !mutedByUser;
-  audio.setVolume(mutedByUser ? 0 : vol);
-  Serial.printf("[K4] %s\n", mutedByUser ? "PAUSED" : "RESUME");
-  drawScreen();
-}
 
 /* ==================== 配网（家里 WiFi 连不上时） ==================== */
 void buildCfgHtml() {
