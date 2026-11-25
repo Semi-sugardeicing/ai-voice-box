@@ -680,7 +680,28 @@ void setupWeb() {
     ESP.restart();
   });
 
-  cfgServer.onNotFound([]() { buildCfgHtml(); });
+  /* ---- Captive Portal：让手机自动弹出配置页（关键，别删）----
+     iOS/macOS 探 hotspot-detect.html，Android 探 generate_204，
+     Windows 探 connecttest.txt/ncsi.txt。这些路径必须回"需认证"的信号，
+     手机才会认定"此网需登录"并自动拉起浏览器。只做 DNS 劫持不够。 */
+  cfgServer.on("/hotspot-detect.html", []() { cfgServer.send(200, "text/html", "Success"); });
+  cfgServer.on("/generate_204",        []() { cfgServer.send(204, "text/plain", ""); });
+  cfgServer.on("/gen_204",             []() { cfgServer.send(204, "text/plain", ""); });
+  cfgServer.on("/connecttest.txt",     []() { cfgServer.send(200, "text/plain", "Microsoft Connect Test"); });
+  cfgServer.on("/ncsi.txt",            []() { cfgServer.send(200, "text/plain", "Microsoft NCSI"); });
+  cfgServer.on("/canonical.html",      []() {
+    cfgServer.sendHeader("Location", "http://192.168.4.1/");
+    cfgServer.send(302, "text/plain", "");
+  });
+  cfgServer.on("/redirect",            []() {
+    cfgServer.sendHeader("Location", "http://192.168.4.1/");
+    cfgServer.send(302, "text/plain", "");
+  });
+
+  cfgServer.onNotFound([]() {
+    cfgServer.sendHeader("Location", "http://192.168.4.1/");
+    cfgServer.send(302, "text/plain", "");
+  });
   cfgServer.begin();
 }
 
