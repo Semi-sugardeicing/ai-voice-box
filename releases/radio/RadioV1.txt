@@ -54,12 +54,14 @@ bool screenOK = false;
 
 /* ---------------- 音频 ---------------- */
 Audio audio;
+const uint32_t IN_BUF_TOTAL = 1000 * 1024;   /* 与 setBufsize 的 PSRAM 部分一致 */
 
 /* ---------------- 前置声明 ---------------- */
 void drawScreen();
 void startStation(int idx);
 void toggleMute();
-void audioInfo(Audio::msg_t m);
+void audio_showstreamtitle(const char* info);
+void audio_eof_stream(const char* info);
 
 /* ---------------- WiFi ----------------
    ★ 注意：CMCC-KPX5_5G 是 5GHz，ESP32-S3 只支持 2.4GHz，
@@ -159,7 +161,7 @@ void drawScreen() {
   display.print(stLine2.c_str());
 
   /* 缓冲条：input buffer 填充率，能看出它还在不在收数据 */
-  uint32_t tot = audio.getInBufferSize();
+  uint32_t tot = IN_BUF_TOTAL;
   uint32_t fil = audio.inBufferFilled();
   int pct = (tot > 0) ? (int)((uint64_t)fil * 100 / tot) : 0;
   if (pct > 100) pct = 100;
@@ -338,27 +340,27 @@ void handleKeys() {
   if (justPressed(bStop)) { toggleMute(); }
 }
 
-/* ==================== 音频事件回调 ==================== */
-void audioInfo(Audio::msg_t m) {
-  switch (m.e) {
-    case Audio::evt_info:
-      break;
-    case Audio::evt_streamtitle:
-      if (m.msg && *m.msg) stLine2 = String("Now: ") + m.msg;
-      break;
-    case Audio::evt_bitrate:
-      break;
-    case Audio::evt_eof:
-      Serial.println("[AUDIO] eof / stream ended");
-      stLine1 = "stream ended";
-      stLine2 = "K3 = reconnect";
-      playing = false;
-      break;
-    case Audio::evt_log:
-      break;
-    default:
-      break;
+/* ==================== 音频事件回调 ====================
+   audioI2S 3.x 用弱符号函数做回调，不是 4.x 的 std::function。
+   这里只实现需要的几个，其余不实现即为空。 */
+void audio_showstreamtitle(const char* info) {
+  if (info && *info) {
+    stLine2 = String("Now: ") + info;
+    Serial.printf("[META] %s\n", info);
   }
+}
+void audio_showstation(const char* info) {
+  if (info && *info) Serial.printf("[STATION] %s\n", info);
+}
+void audio_eof_stream(const char* info) {
+  Serial.println("[AUDIO] eof stream");
+  playing = false;
+  stLine1 = "stream ended";
+  stLine2 = "K3 = reconnect";
+}
+void audio_info(const char* info) {
+  /* 打开会刷屏，调试时再开 */
+  // Serial.printf("[A] %s\n", info);
 }
 
 /* ==================== setup / loop ==================== */
@@ -392,7 +394,7 @@ void setup() {
   audio.setPinout(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DOUT);
   audio.setVolume(vol);
   audio.setConnectionTimeout(6000, 6000);
-  audio.audio_info_callback = audioInfo;
+  audio.setBufsize(4096, 1024 * 1000);   /* RAM 4K + PSRAM 1M */
 
   /* 网络 */
   connectWifi();
@@ -412,7 +414,7 @@ void loop() {
   /* ---- 断流自恢复：缓冲 12 秒没变化，判定卡死 -> 重连 ---- */
   if (now - lastBufChg > 3000) {
     lastBufChg = now;
-    uint32_t tot = audio.getInBufferSize();
+    uint32_t tot = IN_BUF_TOTAL;
     uint32_t fil = audio.inBufferFilled();
     uint32_t pct = (tot > 0) ? (uint32_t)((uint64_t)fil * 100 / tot) : 0;
     if (pct != lastBufPct) {
