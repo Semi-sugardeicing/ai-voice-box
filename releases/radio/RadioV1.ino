@@ -3,8 +3,8 @@
    ======================================================================
    板子      ESP32-S3 N16R8（Flash 16M / PSRAM 8M）
    编译参数  esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=default_8MB
-   依赖库    ESP32-audioI2S（schreibfaul1）版本 4.0.1 及以上
-             Adafruit SSD1306 + Adafruit GFX（Arduino 库里直接装）
+   依赖库    ESP32-audioI2S  **3.0.12**（不是 4.x！4.x 要 C++20，2.0.17 内核编不过）
+             Adafruit SSD1306 + Adafruit GFX（+ BusIO，SSD1306 依赖）
 
    接线（和 AI 盒子一模一样，一根线都不用动）
      SPK MAX98357 : VIN->5V  GND->GND  SD->3.3V  DIN->4  BCLK->5  LRC->6
@@ -18,7 +18,7 @@
      K4 *  紧急暂停（任何状态下立刻静音，再按恢复）
 
    ★★ 本文件里有家里 WiFi 明文密码，只在本地保存 ★★
-      不要推到任何公开仓库。要公开就把 WIFI_LIST 换成占位符。
+      不要推到任何公开仓库。要公开就把 WIFI_LIST 改成占位符。
    ====================================================================== */
 
 #define FW_VER 1
@@ -54,13 +54,56 @@ bool screenOK = false;
 
 /* ---------------- 音频 ---------------- */
 Audio audio;
-const uint32_t IN_BUF_TOTAL = 1000 * 1024;   /* 与 setBufsize 的 PSRAM 部分一致 */
+const uint32_t IN_BUF_TOTAL = 1000UL * 1024UL;   /* setBufsize 的 PSRAM 部分 */
+
+/* ---------------- 电台表 ---------------- */
+struct Station { const char* name; const char* url; };
+Station STATIONS[] = {
+  { "中国之声", "https://ngcdn001.cnr.cn/live/zgzs/index.m3u8" },
+  { "经济之声", "https://ngcdn001.cnr.cn/live/jjzs/index.m3u8" },
+  { "音乐之声", "https://ngcdn001.cnr.cn/live/yyzs/index.m3u8" },
+  { "中华之声", "https://ngcdn001.cnr.cn/live/zhzs/index.m3u8" },
+  { "神州之声", "https://ngcdn001.cnr.cn/live/szzs/index.m3u8" },
+  { "文艺之声", "https://ngcdn001.cnr.cn/live/wyzs/index.m3u8" },
+};
+const int ST_NUM = sizeof(STATIONS) / sizeof(STATIONS[0]);
+
+/* ---------------- 状态 ---------------- */
+int      curSt       = 0;
+bool     playing     = false;
+bool     mutedByUser = false;
+uint8_t  vol         = 7;               /* 0..21 */
+String   stLine1     = "";              /* 屏幕第二行小字 */
+String   stLine2     = "";              /* 屏幕第三行小字 */
+bool     wifiReady   = false;
+unsigned long lastDraw   = 0;
+unsigned long lastBufChk = 0;
+uint32_t      lastBufPct = 0xFFFFFFFF;
+
+/* ---------------- WiFi ----------------
+   ★ CMCC-KPX5_5G 是 5GHz，ESP32-S3 只支持 2.4GHz，
+     所以这里写不带 _5G 的 CMCC-KPX5（两个密码一样）。 */
+struct WifiItem { const char* ssid; const char* pass; };
+WifiItem WIFI_LIST[] = {
+  { "CMCC-KPX5",  "YQ2SFENV" },   /* 家里 2.4G */
+};
+const int WIFI_NUM = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
+WiFiMulti wifiMulti;
+
+Preferences prefs;
+
+/* 配网热点 */
+WebServer cfgServer(80);
+DNSServer dnsServer;
+bool cfgMode = false;
+const char* AP_SSID = "Radio-Setup";
+const char* AP_PASS = "12345678";
 
 /* ---------------- 前置声明 ---------------- */
 void drawScreen();
 void startStation(int idx);
 void toggleMute();
-void audio_showstreamtitle(const char* info);
+void handleKeys();
 
 /* ==================== 按键 ==================== */
 struct KeyBtn { uint8_t pin; bool stable; bool lastRead; unsigned long tMs; bool fired; };
@@ -69,7 +112,6 @@ KeyBtn bNext = { BTN_NEXT, HIGH, HIGH, 0, false };
 KeyBtn bOk   = { BTN_OK,   HIGH, HIGH, 0, false };
 KeyBtn bStop = { BTN_STOP, HIGH, HIGH, 0, false };
 
-/* 返回 true = 刚按下那一下（只在松开后重新计数） */
 bool keyPressed(KeyBtn& kb) {
   bool rd = digitalRead(kb.pin);
   unsigned long now = millis();
@@ -86,57 +128,9 @@ bool keyPressed(KeyBtn& kb) {
 void handleKeys() {
   if (keyPressed(bPrev)) { Serial.println("[K1] prev"); startStation(curSt - 1); }
   if (keyPressed(bNext)) { Serial.println("[K2] next"); startStation(curSt + 1); }
-  if (keyPressed(bOk))   { Serial.println("[K3] ok/retry"); startStation(curSt); }
+  if (keyPressed(bOk))   { Serial.println("[K3] retry"); startStation(curSt); }
   if (keyPressed(bStop)) { toggleMute(); }
 }
-
-void audio_eof_stream(const char* info);
-
-/* ---------------- WiFi ----------------
-   ★ 注意：CMCC-KPX5_5G 是 5GHz，ESP32-S3 只支持 2.4GHz，
-     所以这里必须写不带 _5G 的那个 CMCC-KPX5（两个密码一样）。 */
-struct WifiItem { const char* ssid; const char* pass; };
-WifiItem WIFI_LIST[] = {
-  { "CMCC-KPX5",   "YQ2SFENV" },   /* 家里 2.4G（5G 那个 S3 连不上）*/
-};
-const int WIFI_NUM = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
-WiFiMulti wifiMulti;
-
-/* ---------------- 电台表 ----------------
-   央广是 HLS（.m3u8 + .ts），audioI2S 4.x 原生支持，直接给 .m3u8
-   想加别的台：照着格式加一行，注意 URL 要能直连（不带 token） */
-struct Station { const char* name; const char* url; };
-Station STATIONS[] = {
-  { "中国之声", "https://ngcdn001.cnr.cn/live/zgzs/index.m3u8" },
-  { "经济之声", "https://ngcdn001.cnr.cn/live/jjzs/index.m3u8" },
-  { "音乐之声", "https://ngcdn001.cnr.cn/live/yyzs/index.m3u8" },
-  { "中华之声", "https://ngcdn001.cnr.cn/live/zhzs/index.m3u8" },
-  { "神州之声", "https://ngcdn001.cnr.cn/live/szzs/index.m3u8" },
-  { "文艺之声", "https://ngcdn001.cnr.cn/live/wyzs/index.m3u8" },
-};
-const int ST_NUM = sizeof(STATIONS) / sizeof(STATIONS[0]);
-
-/* ---------------- 状态 ---------------- */
-int      curSt       = 0;
-bool     playing     = false;
-bool     mutedByUser = false;
-uint8_t  vol         = 7;          /* 0..21 */
-String   stLine1     = "";         /* 屏幕第二行小字 */
-String   stLine2     = "";         /* 屏幕第三行小字 */
-bool     wifiReady   = false;
-unsigned long lastDraw     = 0;
-unsigned long lastBufChg   = 0;   /* 缓冲上次变化的时间，用来发现"卡死" */
-uint32_t      lastBufPct   = 0xFFFFFFFF;
-bool          needReconnect = false;
-
-Preferences prefs;
-
-/* 配网热点 */
-WebServer cfgServer(80);
-DNSServer dnsServer;
-bool cfgMode = false;
-const char* AP_SSID = "Radio-Setup";
-const char* AP_PASS = "12345678";
 
 /* ==================== 屏幕 ==================== */
 void drawWifiBar(int rssi) {
@@ -175,24 +169,23 @@ void drawScreen() {
   }
   display.drawLine(0, 10, SCR_W - 1, 10, SSD1306_WHITE);
 
-  /* 台名（16px 汉字，最长 4 字 = 64px，一行够） */
+  /* 台名 16px 汉字 */
   display.setTextSize(2);
   display.setCursor(0, 14);
   display.print(STATIONS[curSt].name);
 
   display.setTextSize(1);
   display.setCursor(0, 34);
-  if (mutedByUser)      display.print("|| PAUSED  K4=resume");
-  else if (!wifiReady)  display.print("connecting wifi...");
-  else                  display.print(stLine1.c_str());
+  if (mutedByUser)     display.print("|| PAUSED  K4=resume");
+  else if (!wifiReady) display.print("connecting wifi...");
+  else                 display.print(stLine1.c_str());
 
   display.setCursor(0, 44);
   display.print(stLine2.c_str());
 
-  /* 缓冲条：input buffer 填充率，能看出它还在不在收数据 */
-  const uint32_t tot = IN_BUF_TOTAL;
+  /* 缓冲条 */
   uint32_t fil = audio.inBufferFilled();
-  int pct = (tot > 0) ? (int)((uint64_t)fil * 100 / tot) : 0;
+  int pct = (int)(fil * 100ULL / IN_BUF_TOTAL);
   if (pct > 100) pct = 100;
   display.drawRect(0, 54, SCR_W, 8, SSD1306_WHITE);
   if (pct > 0) display.fillRect(1, 55, (SCR_W - 2) * pct / 100, 6, SSD1306_WHITE);
@@ -202,7 +195,7 @@ void drawScreen() {
 
 /* ==================== 电台 ==================== */
 void startStation(int idx) {
-  if (idx < 0)      idx = ST_NUM - 1;
+  if (idx < 0)       idx = ST_NUM - 1;
   if (idx >= ST_NUM) idx = 0;
   curSt = idx;
   mutedByUser = false;
@@ -246,7 +239,7 @@ void buildCfgHtml() {
   h += F("'></p><p>密码<br><input name=pass style='width:100%;padding:8px' value=''></p>");
   h += F("<p><button style='padding:10px 24px;font-size:16px'>保存并连接</button></p></form>");
   h += F("<p style='color:#666;font-size:13px'>保存后板子会自动重启连接。密码只存在板子里。</p>");
-  h += F("<hr><p>已有记录：<br>");
+  h += F("<hr><p>出厂预置：<br>");
   for (int i = 0; i < WIFI_NUM; i++) h += String(i + 1) + ". " + WIFI_LIST[i].ssid + "<br>";
   h += F("</p></body>");
 
@@ -271,8 +264,7 @@ void runCfgPortal() {
       prefs.putString("ssid", s);
       prefs.putString("pass", p);
       prefs.end();
-      cfgServer.send(200, "text/html; charset=utf-8",
-        "<meta charset=utf-8><h3>已保存，正在重启…</h3>");
+      cfgServer.send(200, "text/html; charset=utf-8", "<meta charset=utf-8><h3>已保存，正在重启…</h3>");
       delay(1200);
       ESP.restart();
     } else {
@@ -282,7 +274,7 @@ void runCfgPortal() {
   cfgServer.onNotFound([]() { buildCfgHtml(); });
   cfgServer.begin();
 
-  Serial.printf("[AP] %s / %s  ->  http://192.168.4.1\n", AP_SSID, AP_PASS);
+  Serial.printf("[AP] %s / %s -> http://192.168.4.1\n", AP_SSID, AP_PASS);
 
   while (true) {
     dnsServer.processNextRequest();
@@ -305,9 +297,8 @@ void runCfgPortal() {
 
 void connectWifi() {
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);          /* 关省电，播放更顺 */
+  WiFi.setSleep(false);
 
-  /* NVS 里存的（网页填的）优先级最高 */
   prefs.begin("radio", true);
   String s = prefs.getString("ssid", "");
   String p = prefs.getString("pass", "");
@@ -319,31 +310,26 @@ void connectWifi() {
   }
   for (int i = 0; i < WIFI_NUM; i++) wifiMulti.addAP(WIFI_LIST[i].ssid, WIFI_LIST[i].pass);
 
-  if (!screenOK) delay(1500);
-  else {
+  if (screenOK) {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);  display.print("WiFi...");
+    display.setCursor(0, 0); display.print("WiFi...");
+    display.setCursor(0, 16); display.print(WIFI_LIST[0].ssid);
     display.display();
   }
 
-  wl_status_t st = (wl_status_t)wifiMulti.run(15000);
-  if (st == WL_CONNECTED) {
+  if (wifiMulti.run(15000) == WL_CONNECTED) {
     wifiReady = true;
-    char ipbuf[20];
-    snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", (unsigned)(WiFi.localIP() & 0xff),
-             (unsigned)((WiFi.localIP() >> 8) & 0xff), (unsigned)((WiFi.localIP() >> 16) & 0xff),
-             (unsigned)((WiFi.localIP() >> 24) & 0xff));
-    Serial.printf("[WIFI] ok: %s  %s  rssi=%d\n", WiFi.SSID().c_str(), ipbuf, WiFi.RSSI());
+    IPAddress ip = WiFi.localIP();
+    Serial.printf("[WIFI] ok: %s  %u.%u.%u.%u  rssi=%d\n",
+                  WiFi.SSID().c_str(), ip[0], ip[1], ip[2], ip[3], WiFi.RSSI());
     return;
   }
   Serial.println("[WIFI] FAILED -> config portal");
-  runCfgPortal();     /* 不返回 */
+  runCfgPortal();      /* 不返回 */
 }
 
-/* ==================== 音频事件回调 ====================
-   audioI2S 3.x 用弱符号函数做回调，不是 4.x 的 std::function。
-   这里只实现需要的几个，其余不实现即为空。 */
+/* ==================== 音频回调（audioI2S 3.x 弱符号风格） ==================== */
 void audio_showstreamtitle(const char* info) {
   if (info && *info) {
     stLine2 = String("Now: ") + info;
@@ -360,7 +346,7 @@ void audio_eof_stream(const char* info) {
   stLine2 = "K3 = reconnect";
 }
 void audio_info(const char* info) {
-  /* 打开会刷屏，调试时再开 */
+  /* 太吵，调试时再打开 */
   // Serial.printf("[A] %s\n", info);
 }
 
@@ -370,7 +356,6 @@ void setup() {
   delay(300);
   Serial.printf("\n=== Radio V%d ===\n", FW_VER);
 
-  /* 屏幕 */
   Wire.begin(PIN_SDA, PIN_SCL);
   screenOK = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   if (screenOK) {
@@ -385,24 +370,20 @@ void setup() {
     Serial.println("[OLED] not found");
   }
 
-  /* 引脚 */
   pinMode(BTN_PREV, INPUT_PULLUP);
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_OK,   INPUT_PULLUP);
   pinMode(BTN_STOP, INPUT_PULLUP);
 
-  /* 音频 */
   audio.setPinout(PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DOUT);
   audio.setVolume(vol);
   audio.setConnectionTimeout(6000, 6000);
-  audio.setBufsize(4096, 1024 * 1000);   /* RAM 4K + PSRAM 1M */
+  audio.setBufsize(4096, 1000 * 1024);      /* RAM 4K + PSRAM 1M */
 
-  /* 网络 */
   connectWifi();
   stLine1 = "ready";
   drawScreen();
 
-  /* 开机自动放第一个台 */
   startStation(0);
 }
 
@@ -412,42 +393,36 @@ void loop() {
 
   unsigned long now = millis();
 
-  /* ---- 断流自恢复：缓冲 12 秒没变化，判定卡死 -> 重连 ---- */
-  if (now - lastBufChg > 3000) {
-    lastBufChg = now;
-    const uint32_t tot = IN_BUF_TOTAL;
+  /* 断流自恢复：缓冲一直空着 12 秒 -> 重连 */
+  if (now - lastBufChk > 2000) {
+    lastBufChk = now;
     uint32_t fil = audio.inBufferFilled();
-    uint32_t pct = (tot > 0) ? (uint32_t)((uint64_t)fil * 100 / tot) : 0;
-    if (pct != lastBufPct) {
-      lastBufPct = pct;
-    } else if (playing && !mutedByUser && pct == 0) {
-      /* 缓冲一直是 0 = 没数据进来 */
+    if (fil != lastBufPct) {
+      lastBufPct = fil;
+      lastBufChk = now;
+    } else if (playing && !mutedByUser && fil == 0) {
       static unsigned long zeroSince = 0;
       if (zeroSince == 0) zeroSince = now;
       else if (now - zeroSince > 12000) {
         zeroSince = 0;
+        lastBufPct = 0xFFFFFFFF;
         Serial.println("[AUTO] no data 12s -> reconnect");
         stLine1 = "stalled, retry...";
         drawScreen();
         startStation(curSt);
       }
-    } else {
-      /* 有变化就清零计时 */
     }
   }
 
-  /* 每 300ms 刷一次屏 */
   if (now - lastDraw > 300) {
     lastDraw = now;
-    if (wifiReady) {
-      if (WiFi.status() != WL_CONNECTED) {
-        wifiReady = false;
-        Serial.println("[WIFI] lost");
-      } else if (!mutedByUser && audio.isRunning()) {
-        uint32_t br = audio.getBitRate();
-        stLine1 = String("playing ") + audio.getCodecname();
-        if (br) stLine2 = String((unsigned)(br / 1000)) + " kbps";
-      }
+    if (wifiReady && WiFi.status() != WL_CONNECTED) {
+      wifiReady = false;
+      Serial.println("[WIFI] lost");
+    } else if (!mutedByUser && audio.isRunning()) {
+      uint32_t br = audio.getBitRate();
+      stLine1 = String("playing ") + audio.getCodecname();
+      if (br) stLine2 = String((unsigned)(br / 1000)) + " kbps";
     }
     drawScreen();
   }
