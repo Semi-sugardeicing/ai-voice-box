@@ -377,11 +377,9 @@ void drawScreen() {
     display.setCursor(45, 0);
     display.printf("E%d", vol);                     /* 音量 45..57 */
     display.setCursor(60, 0);
-    drawZhString("℃", 60, 0);                      /* 摄氏度符号 */
-    display.setCursor(76, 0);
-    display.printf("%d", chipTemp);                 /* 温度 76..88 */
-    display.setCursor(92, 0);
-    display.printf("v%d", FW_VER);                  /* 版本 92..128 */
+    display.printf("T%d", chipTemp);                /* 温度 60..78 */
+    display.setCursor(84, 0);
+    display.printf("v%d", FW_VER);                  /* 版本 84..128 */
   } else {
     display.setCursor(14, 0); display.print("NO WIFI");
   }
